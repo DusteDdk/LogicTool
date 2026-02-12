@@ -1,0 +1,20 @@
+{
+  "name": "logic-mcp-manifest",
+  "version": "1.0",
+  "entrypoint": ".logic_mcp_manifest/manifest.md",
+  "references": [
+    ".logic_mcp_manifest/examples.md",
+    ".logic_mcp_manifest/AGENTS.snippet.md"
+  ],
+  "tools": {
+    "logic_set_rule": "Set (create/replace) a persistent rule.",
+    "logic_remove_rule": "Remove (disable active) a persistent rule.",
+    "logic_set_bundle": "Set (create/replace) a persistent SMT2 bundle.",
+    "logic_remove_bundle": "Remove (disable active) a persistent bundle.",
+    "logic_set_expectation": "Set (create/replace) a rule-to-rule expectation.",
+    "logic_remove_expectation": "Remove (disable active) an expectation.",
+    "logic_check": "Run baseline/candidate what-if check.",
+    "logic_context_patch": "Apply atomic context/meta mutations.",
+    "logic_list": "Unified list/lookup for logic and context inventory."
+  }
+}
