@@ -114,6 +114,36 @@ The server exposes 9 tools:
 - `logic_context_patch`
 - `logic_list`
 
+`tools/list` includes:
+- tool `title` and long-form `description`
+- field-level input schema descriptions
+- common output envelope schemas
+- tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`)
+- execution hint (`taskSupport`)
+
+## MCP discovery surfaces
+Beyond tools, the server exposes:
+- `resources/list` / `resources/read`:
+  - `logic://guide/overview`
+  - `logic://guide/incremental-strategy`
+  - `logic://guide/manifest`
+  - `logic://guide/examples`
+  - `logic://guide/use-cases`
+  - `logic://guide/use-case-index`
+  - `logic://session/current/snapshot`
+  - `logic://session/current/playbook`
+- `resources/templates/list`:
+  - `logic://session/{session_id}/inventory/{detail_level}` (optional query: `show`, `limit`, `cursor`)
+  - `logic://session/{session_id}/item/{item_id}` (optional query: `detail_level`)
+  - `logic://session/{session_id}/playbook/{focus}`
+- `prompts/list` / `prompts/get`:
+  - `logic_orient`
+  - `logic_capture_discovery`
+  - `logic_experiment_loop`
+  - `logic_graph_handoff`
+- `completion/complete`:
+  - argument suggestions for common prompt/template fields (`detail_level`, `show`, `focus`, `session_id`, `item_id`)
+
 ## Request shapes
 MCP already carries tool name, so the simplest payloads do not need a `tool` field.
 

@@ -12,11 +12,14 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
 
 import mcp.types as types
 import z3
 from mcp.server import Server
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.lowlevel.server import request_ctx
 
 from .audit_log import append_tool_log, build_tool_call_payload
@@ -2379,174 +2382,1092 @@ def get_engine(namespace_id: Optional[str] = None) -> LogicEngine:
 server = Server("logic-tool-server", version="1.0")
 
 
-@server.list_tools()
-async def list_tools(_: types.ListToolsRequest | None = None) -> types.ListToolsResult:
-    tools = []
+DETAIL_LEVEL_VALUES = ["minimal", "compact", "more", "full"]
+LIST_SHOW_VALUES = ["all", "bundles", "rules", "expectations", "concepts", "code_bindings"]
+RULE_LANG_VALUES = ["pyexpr", "smt2"]
+EXPECTATION_KIND_VALUES = ["entails", "equivalent"]
+CONTEXT_PATCH_OPS = [
+    "set_concept",
+    "remove_concept",
+    "set_code_binding",
+    "remove_code_binding",
+    "set_rule_meta",
+    "set_expectation_meta",
+]
+PLAYBOOK_FOCUS_VALUES = ["onboarding", "discovery", "experiment", "hygiene", "handoff"]
 
-    def tool_schema(name: str, description: str, props: dict, required: list[str]) -> types.Tool:
-        return types.Tool(
-            name=name,
-            description=description,
-            inputSchema={
+MANIFEST_DIR = Path(__file__).resolve().parent.parent / ".logic_mcp_manifest"
+
+
+def _tool_response_schema(result_schema: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "description": "Common success/error envelope for all logic tools.",
+        "properties": {
+            "ok": {"type": "boolean"},
+            "result": result_schema
+            or {
                 "type": "object",
-                "properties": props,
-                "required": required,
-                "additionalProperties": False,
+                "description": "Tool-specific result object when ok=true.",
+                "additionalProperties": True,
             },
-        )
+            "error": {
+                "type": "object",
+                "description": "Error payload when ok=false.",
+                "properties": {
+                    "code": {"type": "string"},
+                    "message": {"type": "string"},
+                    "details": {"type": "object", "additionalProperties": True},
+                },
+                "required": ["code", "message"],
+                "additionalProperties": True,
+            },
+        },
+        "required": ["ok"],
+        "additionalProperties": True,
+    }
 
+
+def _tool_annotations(
+    *,
+    read_only: bool,
+    destructive: bool,
+    idempotent: bool,
+    open_world: bool,
+) -> types.ToolAnnotations:
+    return types.ToolAnnotations(
+        readOnlyHint=read_only,
+        destructiveHint=destructive,
+        idempotentHint=idempotent,
+        openWorldHint=open_world,
+    )
+
+
+def _manifest_text(filename: str, fallback: str) -> str:
+    path = MANIFEST_DIR / filename
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return fallback
+
+
+def _prefixed(values: list[str], prefix: str) -> list[str]:
+    if not prefix:
+        return values
+    pfx = prefix.lower()
+    return [v for v in values if v.lower().startswith(pfx)]
+
+
+def _resolve_session_token(token: str, active_session: str) -> str:
+    if token in {"current", "active", "this"}:
+        return active_session
+    if token == active_session:
+        return active_session
+    raise ValueError(f"session_id '{token}' does not match active session '{active_session}'")
+
+
+def _summarize_ids(items: list[dict], item_type: str, limit: int = 6) -> list[str]:
+    ids = sorted(item.get("id") for item in items if item.get("type") == item_type and isinstance(item.get("id"), str))
+    return ids[:limit]
+
+
+def _session_snapshot_markdown(session_id: str) -> str:
+    engine = get_engine(session_id)
+    listing = engine.list_items({"show": ["all"], "detail_level": "minimal", "limit": 500})
+    items = listing.get("result", {}).get("items", [])
+    counts = {"bundle": 0, "rule": 0, "expectation": 0, "concept": 0, "code_binding": 0}
+    for item in items:
+        item_type = item.get("type")
+        if item_type in counts:
+            counts[item_type] += 1
+
+    lines = [
+        f"# Session Snapshot ({session_id})",
+        "",
+        "Use this as a low-cost orientation before mutations.",
+        "",
+        "## Counts",
+        f"- bundles: {counts['bundle']}",
+        f"- rules: {counts['rule']}",
+        f"- expectations: {counts['expectation']}",
+        f"- concepts: {counts['concept']}",
+        f"- code_bindings: {counts['code_binding']}",
+        "",
+        "## Sample IDs",
+        f"- rules: {', '.join(_summarize_ids(items, 'rule')) or '(none)'}",
+        f"- expectations: {', '.join(_summarize_ids(items, 'expectation')) or '(none)'}",
+        f"- concepts: {', '.join(_summarize_ids(items, 'concept')) or '(none)'}",
+        f"- code_bindings: {', '.join(_summarize_ids(items, 'code_binding')) or '(none)'}",
+        "",
+        "## Suggested Next Calls",
+        "1. `logic_list` with `detail_level:\"minimal\"` and narrow `show` filters.",
+        "2. Add or update one rule/expectation/context item at a time.",
+        "3. Run `logic_check` with a temporary `hypothesis.patch` for experiments.",
+        "4. Escalate to `detail_level:\"more\"|\"full\"` only when diagnostics are needed.",
+    ]
+    return "\n".join(lines)
+
+
+def _inventory_resource_json(session_id: str, detail_level: str, query: dict[str, list[str]]) -> str:
+    args: dict[str, Any] = {"detail_level": detail_level}
+
+    show_values: list[str] = []
+    for raw in query.get("show", []):
+        for part in raw.split(","):
+            item = part.strip()
+            if item:
+                show_values.append(item)
+    if show_values:
+        args["show"] = show_values
+
+    limit_values = query.get("limit")
+    if limit_values:
+        args["limit"] = int(limit_values[0])
+
+    cursor_values = query.get("cursor")
+    if cursor_values:
+        args["cursor"] = cursor_values[0]
+
+    result = get_engine(session_id).list_items(args)
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+def _item_resource_json(session_id: str, item_id: str, query: dict[str, list[str]]) -> str:
+    detail_level = "full"
+    detail_values = query.get("detail_level")
+    if detail_values and detail_values[0]:
+        detail_level = detail_values[0]
+    result = get_engine(session_id).list_items({"id": item_id, "detail_level": detail_level})
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+def _playbook_markdown(session_id: str, focus: str) -> str:
+    focus_key = focus if focus in PLAYBOOK_FOCUS_VALUES else "discovery"
+    opening = [
+        f"# Reasoning Playbook ({session_id})",
+        "",
+        f"Focus: `{focus_key}`",
+        "",
+    ]
+    sections: dict[str, list[str]] = {
+        "onboarding": [
+            "1. Call `logic_list` with `show:[\"all\"]`, `detail_level:\"minimal\"`.",
+            "2. Fetch specific IDs with `logic_list {\"id\":\"...\"}` before modifying.",
+            "3. Capture discovered invariants with `logic_set_rule` in small independent units.",
+            "4. Attach context links incrementally with `logic_context_patch`.",
+        ],
+        "discovery": [
+            "1. Convert each newly discovered requirement into one small `logic_set_rule` call.",
+            "2. When omission risk appears, add one `logic_set_expectation` immediately.",
+            "3. Add code/concept anchors as soon as they are known via `logic_context_patch`.",
+            "4. Re-run `logic_check` after each modest change instead of batching large edits.",
+        ],
+        "experiment": [
+            "1. Keep persistent state stable; use `logic_check.hypothesis.patch` for trial ideas.",
+            "2. Try one patch at a time and inspect `breaks`, `delta`, `expectation_failures`.",
+            "3. Start with `detail_level:\"compact\"`; escalate to `more` or `full` only on demand.",
+            "4. Persist only the experiments that survived checks.",
+        ],
+        "hygiene": [
+            "1. Before remove/replace, inspect dependencies with `logic_list`.",
+            "2. Remove fragile links in safe order: expectations/context first, then rule/bundle.",
+            "3. Keep context graph coherent by updating concepts and code bindings together.",
+            "4. Prefer many reversible edits over one large destructive migration.",
+        ],
+        "handoff": [
+            "1. Export focused inventories (`rules`,`expectations`,`concepts`,`code_bindings`).",
+            "2. Provide key ID lookups (`logic_list {\"id\":\"...\"}`) for critical nodes.",
+            "3. Attach one recent `logic_check` result that explains current breakage risk.",
+            "4. Include what-if candidates as temporary patch snippets, not persisted edits.",
+        ],
+    }
+    body = sections[focus_key]
+    trailer = [
+        "",
+        "Core heuristic: prefer many modestly sized calls and checks to avoid hidden coupling and reduce reasoning cost.",
+    ]
+    return "\n".join(opening + body + trailer)
+
+
+def _base_tool_result_meta() -> dict[str, Any]:
+    return {
+        "result_contract": "ok_or_error_envelope",
+        "error_codes": [
+            "E_INVALID_REQUEST",
+            "E_UNKNOWN_ID",
+            "E_PARSE_ERROR",
+            "E_UNSUPPORTED",
+            "E_SOLVER_ERROR",
+            "E_TIMEOUT",
+        ],
+    }
+
+
+def _logic_tools() -> list[types.Tool]:
     rule_content_schema = {
+        "description": "Rule/bundle content. For pyexpr use a single expression string. For smt2 use one string or a command array.",
         "oneOf": [
-            {"type": "string"},
-            {"type": "array", "items": {"type": "string"}},
-        ]
+            {
+                "type": "string",
+                "description": "Single expression (pyexpr) or newline-delimited SMT2 text.",
+                "examples": ["retry_limit >= 0", "(declare-const x Int)\n(assert (> x 0))"],
+            },
+            {
+                "type": "array",
+                "description": "SMT2 commands as ordered lines.",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "examples": [["(declare-const x Int)", "(assert (> x 0))"]],
+            },
+        ],
     }
     rule_patch_schema = {
         "type": "object",
+        "description": "Temporary rule override/addition used only inside logic_check.hypothesis.patch.",
         "properties": {
-            "lang": {"type": "string", "enum": ["pyexpr", "smt2"]},
+            "lang": {
+                "type": "string",
+                "enum": RULE_LANG_VALUES,
+                "description": "Rule language for the temporary patch rule.",
+            },
             "rule": rule_content_schema,
         },
         "required": ["lang", "rule"],
         "additionalProperties": False,
     }
+    list_result_schema = {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "description": "Page of list entries. Shape varies by item type and detail_level.",
+                "items": {"type": "object", "additionalProperties": True},
+            },
+            "next_cursor": {
+                "type": "string",
+                "description": "Present when additional items remain; pass this to the next logic_list call.",
+            },
+        },
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+    check_result_schema = {
+        "type": "object",
+        "description": "Baseline/candidate outcome and diagnostics shaped by detail_level.",
+        "properties": {
+            "baseline": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["sat", "unsat", "unknown"]},
+                    "unsat_core": {"type": "array", "items": {"type": "string"}},
+                    "model": {"type": "object", "additionalProperties": True},
+                    "reason": {"type": "string"},
+                },
+                "required": ["status"],
+                "additionalProperties": True,
+            },
+            "candidate": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["sat", "unsat", "unknown"]},
+                    "unsat_core": {"type": "array", "items": {"type": "string"}},
+                    "model": {"type": "object", "additionalProperties": True},
+                    "reason": {"type": "string"},
+                },
+                "required": ["status"],
+                "additionalProperties": True,
+            },
+            "breaks": {"type": "boolean"},
+            "delta": {"type": "object", "additionalProperties": True},
+            "expectation_failures": {"type": "object", "additionalProperties": True},
+            "expectations": {"type": "object", "additionalProperties": True},
+            "influence": {"type": "object", "additionalProperties": True},
+        },
+        "required": ["baseline", "candidate", "breaks"],
+        "additionalProperties": False,
+    }
 
-    tools.append(
-        tool_schema(
-            "logic_set_rule",
-            "Set (create/replace) a persistent rule.",
-            {
-                "id": {"type": "string", "minLength": 1},
-                "lang": {"type": "string", "enum": ["pyexpr", "smt2"]},
-                "rule": rule_content_schema,
-            },
-            ["id", "lang", "rule"],
-        )
-    )
-    tools.append(
-        tool_schema(
-            "logic_remove_rule",
-            "Remove (disable active) a persistent rule.",
-            {"id": {"type": "string", "minLength": 1}},
-            ["id"],
-        )
-    )
-    tools.append(
-        tool_schema(
-            "logic_set_bundle",
-            "Set (create/replace) a persistent SMT2 bundle.",
-            {
-                "id": {"type": "string", "minLength": 1},
-                "bundle": rule_content_schema,
-            },
-            ["id", "bundle"],
-        )
-    )
-    tools.append(
-        tool_schema(
-            "logic_remove_bundle",
-            "Remove (disable active) a persistent bundle.",
-            {"id": {"type": "string", "minLength": 1}},
-            ["id"],
-        )
-    )
-    tools.append(
-        tool_schema(
-            "logic_set_expectation",
-            "Set (create/replace) an expectation between two rules.",
-            {
-                "id": {"type": "string", "minLength": 1},
-                "kind": {"type": "string", "enum": ["entails", "equivalent"]},
-                "a_ref": {"type": "string", "minLength": 1},
-                "b_ref": {"type": "string", "minLength": 1},
-            },
-            ["id", "kind", "a_ref", "b_ref"],
-        )
-    )
-    tools.append(
-        tool_schema(
-            "logic_remove_expectation",
-            "Remove (disable active) an expectation.",
-            {"id": {"type": "string", "minLength": 1}},
-            ["id"],
-        )
-    )
-    tools.append(
-        tool_schema(
-            "logic_check",
-            "Run baseline/candidate what-if evaluation over the full active model.",
-            {
-                "hypothesis": {
+    base_meta = _base_tool_result_meta()
+    tools: list[types.Tool] = []
+
+    def add_tool(
+        *,
+        name: str,
+        title: str,
+        description: str,
+        properties: dict[str, Any],
+        required: list[str],
+        read_only: bool,
+        destructive: bool,
+        idempotent: bool,
+        open_world: bool,
+        output_schema: dict[str, Any] | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        tool_meta = dict(base_meta)
+        if meta:
+            tool_meta.update(meta)
+        tools.append(
+            types.Tool(
+                name=name,
+                title=title,
+                description=description,
+                inputSchema={
                     "type": "object",
-                    "properties": {
-                        "facts": {"type": "object"},
-                        "patch": {
-                            "type": "object",
-                            "properties": {
-                                "set_rules": {"type": "object", "additionalProperties": rule_patch_schema},
-                                "remove_rules": {"type": "array", "items": {"type": "string"}},
-                            },
-                            "additionalProperties": False,
-                        },
-                    },
+                    "properties": properties,
+                    "required": required,
                     "additionalProperties": False,
                 },
-                "detail_level": {"type": "string", "enum": ["minimal", "compact", "more", "full"]},
-            },
-            [],
+                outputSchema=output_schema or _tool_response_schema(),
+                annotations=_tool_annotations(
+                    read_only=read_only,
+                    destructive=destructive,
+                    idempotent=idempotent,
+                    open_world=open_world,
+                ),
+                execution=types.ToolExecution(taskSupport="forbidden"),
+                meta=tool_meta,
+            )
         )
+
+    add_tool(
+        name="logic_set_rule",
+        title="Set Rule",
+        description=(
+            "Create/replace one persistent rule. Prefer small, composable rules captured as discoveries appear, "
+            "then validate with logic_check."
+        ),
+        properties={
+            "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Stable global ID for the rule.",
+                "examples": ["r_retry_nonneg"],
+            },
+            "lang": {
+                "type": "string",
+                "enum": RULE_LANG_VALUES,
+                "description": "Rule language.",
+                "examples": ["pyexpr"],
+            },
+            "rule": rule_content_schema,
+        },
+        required=["id", "lang", "rule"],
+        read_only=False,
+        destructive=False,
+        idempotent=False,
+        open_world=False,
+        meta={
+            "use_cases": ["capture_new_invariant", "progressive_specification"],
+            "look_before_act": "Prefer logic_list before edits unless you are certain the ID is new.",
+        },
     )
-    tools.append(
-        tool_schema(
-            "logic_context_patch",
-            "Apply an atomic context/meta patch.",
-            {
-                "ops": {
-                    "type": "array",
-                    "items": {
+    add_tool(
+        name="logic_remove_rule",
+        title="Remove Rule",
+        description=(
+            "Disable a persistent rule. Use only after reviewing dependencies (expectations, concepts, code bindings)."
+        ),
+        properties={
+            "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Rule ID to disable.",
+            }
+        },
+        required=["id"],
+        read_only=False,
+        destructive=True,
+        idempotent=False,
+        open_world=False,
+        meta={"use_cases": ["cleanup", "decommission_rule"], "requires_review": ["logic_list"]},
+    )
+    add_tool(
+        name="logic_set_bundle",
+        title="Set Bundle",
+        description=(
+            "Create/replace one persistent SMT2 bundle, usually declarations shared by multiple rules."
+        ),
+        properties={
+            "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Stable global ID for the bundle.",
+                "examples": ["b_symbols"],
+            },
+            "bundle": {
+                **rule_content_schema,
+                "description": "SMT2 bundle content (declarations/defines/asserts).",
+            },
+        },
+        required=["id", "bundle"],
+        read_only=False,
+        destructive=False,
+        idempotent=False,
+        open_world=False,
+        meta={"use_cases": ["shared_symbol_declarations", "smt2_fragment_reuse"]},
+    )
+    add_tool(
+        name="logic_remove_bundle",
+        title="Remove Bundle",
+        description="Disable a persistent bundle after dependency review.",
+        properties={
+            "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Bundle ID to disable.",
+            }
+        },
+        required=["id"],
+        read_only=False,
+        destructive=True,
+        idempotent=False,
+        open_world=False,
+        meta={"use_cases": ["bundle_cleanup"]},
+    )
+    add_tool(
+        name="logic_set_expectation",
+        title="Set Expectation",
+        description=(
+            "Create/replace one expectation relationship to guard against omission bugs and refactor drift."
+        ),
+        properties={
+            "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Stable global ID for the expectation.",
+                "examples": ["e_total_formula_equiv"],
+            },
+            "kind": {
+                "type": "string",
+                "enum": EXPECTATION_KIND_VALUES,
+                "description": "Expectation mode: entails (A => B) or equivalent (A <=> B).",
+            },
+            "a_ref": {"type": "string", "minLength": 1, "description": "Left-side rule ID (A)."},
+            "b_ref": {"type": "string", "minLength": 1, "description": "Right-side rule ID (B)."},
+        },
+        required=["id", "kind", "a_ref", "b_ref"],
+        read_only=False,
+        destructive=False,
+        idempotent=False,
+        open_world=False,
+        meta={"use_cases": ["omission_guard", "semantic_equivalence_guard"]},
+    )
+    add_tool(
+        name="logic_remove_expectation",
+        title="Remove Expectation",
+        description="Disable one expectation.",
+        properties={
+            "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Expectation ID to disable.",
+            }
+        },
+        required=["id"],
+        read_only=False,
+        destructive=True,
+        idempotent=False,
+        open_world=False,
+        meta={"use_cases": ["expectation_cleanup"]},
+    )
+    add_tool(
+        name="logic_check",
+        title="Check Hypothesis",
+        description=(
+            "Run baseline vs candidate what-if analysis. Prefer many small experiments using hypothesis.patch "
+            "instead of one large speculative rewrite."
+        ),
+        properties={
+            "hypothesis": {
+                "type": "object",
+                "description": "Temporary request-scoped overlay for facts and patch rules.",
+                "properties": {
+                    "facts": {
                         "type": "object",
-                        "properties": {
-                            "op": {
-                                "type": "string",
-                                "enum": [
-                                    "set_concept",
-                                    "remove_concept",
-                                    "set_code_binding",
-                                    "remove_code_binding",
-                                    "set_rule_meta",
-                                    "set_expectation_meta",
-                                ],
-                            },
-                            "id": {"type": "string", "minLength": 1},
-                            "set": {"type": "object"},
+                        "description": (
+                            "Fact overlay. Values can be bool/int/float or symbolic placeholders like '?x:Int'."
+                        ),
+                        "additionalProperties": {
+                            "oneOf": [
+                                {"type": "boolean"},
+                                {"type": "integer"},
+                                {"type": "number"},
+                                {"type": "string"},
+                            ]
                         },
-                        "required": ["op", "id"],
+                    },
+                    "patch": {
+                        "type": "object",
+                        "description": "Temporary rule edits for candidate evaluation only (not persisted).",
+                        "properties": {
+                            "set_rules": {
+                                "type": "object",
+                                "description": "Rule additions/replacements by rule ID.",
+                                "additionalProperties": rule_patch_schema,
+                            },
+                            "remove_rules": {
+                                "type": "array",
+                                "description": "Rule IDs temporarily disabled in candidate evaluation.",
+                                "items": {"type": "string"},
+                            },
+                        },
                         "additionalProperties": False,
                     },
-                }
-            },
-            ["ops"],
-        )
-    )
-    tools.append(
-        tool_schema(
-            "logic_list",
-            "Unified list/lookup for logic and context inventories.",
-            {
-                "show": {
-                    "type": "array",
-                    "items": {"type": "string", "enum": ["all", "bundles", "rules", "expectations", "concepts", "code_bindings"]},
                 },
-                "id": {"type": "string"},
-                "detail_level": {"type": "string", "enum": ["minimal", "compact", "more", "full"]},
-                "cursor": {"type": "string"},
-                "limit": {"type": "integer", "minimum": 1},
+                "additionalProperties": False,
             },
-            [],
-        )
+            "detail_level": {
+                "type": "string",
+                "enum": DETAIL_LEVEL_VALUES,
+                "default": "compact",
+                "description": "Result verbosity/cost. Start compact, escalate only when needed.",
+            },
+        },
+        required=[],
+        read_only=True,
+        destructive=False,
+        idempotent=True,
+        open_world=False,
+        output_schema=_tool_response_schema(check_result_schema),
+        meta={
+            "use_cases": ["what_if_analysis", "counterexample_search", "regression_risk_scan"],
+            "workflow_hint": "Use patch for experiments; persist only successful ideas.",
+        },
+    )
+    add_tool(
+        name="logic_context_patch",
+        title="Patch Context Graph",
+        description=(
+            "Apply atomic updates to concepts, code bindings, and metadata. Keep logic-to-code links current as "
+            "new understanding appears."
+        ),
+        properties={
+            "ops": {
+                "type": "array",
+                "description": "Atomic operation list applied in order.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "enum": CONTEXT_PATCH_OPS,
+                            "description": "Patch operation type.",
+                        },
+                        "id": {"type": "string", "minLength": 1, "description": "Target ID for this operation."},
+                        "set": {
+                            "type": "object",
+                            "description": "Partial payload for set_* operations. Ignored for remove_*.",
+                            "additionalProperties": True,
+                        },
+                    },
+                    "required": ["op", "id"],
+                    "additionalProperties": False,
+                },
+                "minItems": 1,
+            }
+        },
+        required=["ops"],
+        read_only=False,
+        destructive=False,
+        idempotent=False,
+        open_world=False,
+        meta={
+            "use_cases": ["traceability_graph", "ownership_metadata", "incremental_knowledge_capture"],
+            "workflow_hint": "Add concept and code-binding links as soon as entities are discovered.",
+        },
+    )
+    add_tool(
+        name="logic_list",
+        title="List Inventory",
+        description=(
+            "Unified list/lookup across bundles, rules, expectations, concepts, and code bindings. "
+            "Use this first to orient before mutation unless certainty is high."
+        ),
+        properties={
+            "show": {
+                "type": "array",
+                "description": "Item categories to include. Defaults to ['all'].",
+                "items": {"type": "string", "enum": LIST_SHOW_VALUES},
+            },
+            "id": {
+                "type": "string",
+                "description": "Fetch one item by global ID. Mutually exclusive with show.",
+            },
+            "detail_level": {
+                "type": "string",
+                "enum": DETAIL_LEVEL_VALUES,
+                "default": "compact",
+                "description": "Response detail/cost level.",
+            },
+            "cursor": {
+                "type": "string",
+                "description": "Opaque decimal offset returned as next_cursor by a previous page.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 50,
+                "description": "Maximum number of items in one page.",
+            },
+        },
+        required=[],
+        read_only=True,
+        destructive=False,
+        idempotent=True,
+        open_world=False,
+        output_schema=_tool_response_schema(list_result_schema),
+        meta={
+            "use_cases": ["orientation", "pre_edit_scan", "dependency_review", "handoff"],
+            "workflow_hint": "Start minimal, then inspect specific IDs at full detail.",
+        },
     )
 
-    return types.ListToolsResult(tools=tools)
+    return tools
+
+
+@server.list_tools()
+async def list_tools(_: types.ListToolsRequest | None = None) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=_logic_tools())
+
+
+@server.list_resources()
+async def list_resources(_: types.ListResourcesRequest | None = None) -> types.ListResourcesResult:
+    resources = [
+        types.Resource(
+            name="logic_guide_overview",
+            title="Logic Guide Overview",
+            uri="logic://guide/overview",
+            description=(
+                "High-level strategy for using Logic MCP effectively: orient first, model incrementally, "
+                "and run many modest experiments."
+            ),
+            mimeType="text/markdown",
+            annotations=types.Annotations(audience=["assistant"], priority=1.0),
+        ),
+        types.Resource(
+            name="logic_guide_incremental_strategy",
+            title="Logic Incremental Strategy",
+            uri="logic://guide/incremental-strategy",
+            description="Detailed loop emphasizing smaller calls, progressive modeling, and low-cost validation.",
+            mimeType="text/markdown",
+            annotations=types.Annotations(audience=["assistant"], priority=1.0),
+        ),
+        types.Resource(
+            name="logic_manifest",
+            title="Manifest",
+            uri="logic://guide/manifest",
+            description="Manifest guidance shipped with this server installation.",
+            mimeType="text/markdown",
+            annotations=types.Annotations(audience=["assistant"], priority=0.95),
+        ),
+        types.Resource(
+            name="logic_examples",
+            title="Examples",
+            uri="logic://guide/examples",
+            description="Compact request patterns for common reasoning flows.",
+            mimeType="text/markdown",
+            annotations=types.Annotations(audience=["assistant"], priority=0.95),
+        ),
+        types.Resource(
+            name="logic_use_cases",
+            title="Use-Case Catalog",
+            uri="logic://guide/use-cases",
+            description="Extended use-case demonstrations spanning discovery, experimentation, and handoff.",
+            mimeType="text/markdown",
+            annotations=types.Annotations(audience=["assistant"], priority=0.9),
+        ),
+        types.Resource(
+            name="logic_use_case_index",
+            title="Use-Case Index",
+            uri="logic://guide/use-case-index",
+            description="Low-token index of available use-case scenarios.",
+            mimeType="text/markdown",
+            annotations=types.Annotations(audience=["assistant"], priority=0.9),
+        ),
+        types.Resource(
+            name="logic_session_snapshot",
+            title="Session Snapshot",
+            uri="logic://session/current/snapshot",
+            description="Current session inventory counts, sample IDs, and suggested next calls.",
+            mimeType="text/markdown",
+            annotations=types.Annotations(audience=["assistant"], priority=0.98),
+        ),
+        types.Resource(
+            name="logic_session_playbook",
+            title="Session Playbook",
+            uri="logic://session/current/playbook",
+            description="Actionable checklist for incremental reasoning loops in the current session.",
+            mimeType="text/markdown",
+            annotations=types.Annotations(audience=["assistant"], priority=0.96),
+        ),
+    ]
+    return types.ListResourcesResult(resources=resources)
+
+
+@server.list_resource_templates()
+async def list_resource_templates() -> list[types.ResourceTemplate]:
+    return [
+        types.ResourceTemplate(
+            name="logic_session_inventory",
+            title="Session Inventory",
+            uriTemplate="logic://session/{session_id}/inventory/{detail_level}",
+            description=(
+                "Machine-readable inventory snapshot. Optional query params: show=rules,expectations "
+                "& limit=50 & cursor=0."
+            ),
+            mimeType="application/json",
+            annotations=types.Annotations(audience=["assistant"], priority=1.0),
+        ),
+        types.ResourceTemplate(
+            name="logic_session_item",
+            title="Session Item Lookup",
+            uriTemplate="logic://session/{session_id}/item/{item_id}",
+            description="Lookup one item by global ID. Optional query param: detail_level=minimal|compact|more|full.",
+            mimeType="application/json",
+            annotations=types.Annotations(audience=["assistant"], priority=0.96),
+        ),
+        types.ResourceTemplate(
+            name="logic_session_playbook_focus",
+            title="Session Playbook by Focus",
+            uriTemplate="logic://session/{session_id}/playbook/{focus}",
+            description="Focused workflow guidance. focus=onboarding|discovery|experiment|hygiene|handoff.",
+            mimeType="text/markdown",
+            annotations=types.Annotations(audience=["assistant"], priority=0.95),
+        ),
+    ]
+
+
+@server.read_resource()
+async def read_resource(uri: Any) -> Iterable[ReadResourceContents]:
+    uri_text = str(uri)
+    parsed = urlparse(uri_text)
+    scheme = parsed.scheme
+    host = parsed.netloc
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    active_session = get_namespace_id()
+
+    if scheme != "logic":
+        raise ValueError("Only logic:// URIs are supported.")
+
+    if host == "guide":
+        if parts == ["overview"]:
+            text = "\n".join(
+                [
+                    "# Logic MCP Overview",
+                    "",
+                    "Use Logic MCP for solver-backed reasoning whenever constraints can be expressed formally.",
+                    "",
+                    "## Core Operating Pattern",
+                    "1. Orient with `logic_list` before mutations unless certainty is high.",
+                    "2. Add structure incrementally: bundles/rules/expectations/context as discoveries appear.",
+                    "3. Use temporary `logic_check.hypothesis.patch` for experiments.",
+                    "4. Prefer many modest calls over one large speculative construction.",
+                    "5. Persist only the pieces that survive checks.",
+                    "",
+                    "## Why This Pattern",
+                    "- Faster: each call has lower cognitive and token cost.",
+                    "- Safer: smaller changes isolate regressions and reveal dependencies early.",
+                    "- More exact: solver feedback guides each next move with concrete evidence.",
+                ]
+            )
+            return [ReadResourceContents(content=text, mime_type="text/markdown")]
+        if parts == ["incremental-strategy"]:
+            text = "\n".join(
+                [
+                    "# Incremental Strategy",
+                    "",
+                    "## Look Before Act",
+                    "- Run `logic_list` with minimal detail first.",
+                    "- Pull full detail only for IDs you plan to touch.",
+                    "",
+                    "## Capture As You Discover",
+                    "- New invariant: `logic_set_rule`.",
+                    "- Shared declarations: `logic_set_bundle`.",
+                    "- Omission/refactor risk: `logic_set_expectation`.",
+                    "- Traceability to code/spec: `logic_context_patch` concept/binding ops.",
+                    "",
+                    "## Experiment Freely",
+                    "- Keep persistent graph stable.",
+                    "- Use `logic_check` with hypothesis facts/patch for trial ideas.",
+                    "- Compare compact outputs quickly; escalate detail only when needed.",
+                    "",
+                    "## Suggested Loop",
+                    "1. list -> 2. one focused change -> 3. check -> 4. keep/revert idea -> 5. repeat",
+                ]
+            )
+            return [ReadResourceContents(content=text, mime_type="text/markdown")]
+        if parts == ["manifest"]:
+            text = _manifest_text(
+                "manifest.md",
+                "# Manifest\n\nManifest file not found on disk. Use `logic://guide/overview` for default guidance.",
+            )
+            return [ReadResourceContents(content=text, mime_type="text/markdown")]
+        if parts == ["examples"]:
+            text = _manifest_text(
+                "examples.md",
+                "# Examples\n\nExamples file not found on disk. Use tool schemas and prompts for request patterns.",
+            )
+            return [ReadResourceContents(content=text, mime_type="text/markdown")]
+        if parts == ["use-cases"]:
+            text = _manifest_text(
+                "use-case-examples.md",
+                "# Use Cases\n\nUse-case file not found on disk.",
+            )
+            return [ReadResourceContents(content=text, mime_type="text/markdown")]
+        if parts == ["use-case-index"]:
+            src = _manifest_text("use-case-examples.md", "")
+            headings = []
+            for line in src.splitlines():
+                if line.startswith("## "):
+                    headings.append(line[3:].strip())
+            if not headings:
+                headings = [
+                    "Spec-time invariant capture",
+                    "Counterexample search",
+                    "Temporary patch experimentation",
+                    "Traceability graph maintenance",
+                    "Focused handoff review",
+                ]
+            text = "# Use-Case Index\n\n" + "\n".join(f"- {entry}" for entry in headings)
+            return [ReadResourceContents(content=text, mime_type="text/markdown")]
+        raise ValueError(f"Unknown guide resource: {uri_text}")
+
+    if host == "session":
+        if len(parts) == 2 and parts[0] == "current" and parts[1] == "snapshot":
+            text = _session_snapshot_markdown(active_session)
+            return [ReadResourceContents(content=text, mime_type="text/markdown")]
+        if len(parts) == 2 and parts[0] == "current" and parts[1] == "playbook":
+            text = _playbook_markdown(active_session, "discovery")
+            return [ReadResourceContents(content=text, mime_type="text/markdown")]
+        if len(parts) >= 3 and parts[1] == "inventory":
+            session_id = _resolve_session_token(parts[0], active_session)
+            detail_level = parts[2]
+            text = _inventory_resource_json(session_id, detail_level, query)
+            return [ReadResourceContents(content=text, mime_type="application/json")]
+        if len(parts) >= 3 and parts[1] == "item":
+            session_id = _resolve_session_token(parts[0], active_session)
+            item_id = parts[2]
+            text = _item_resource_json(session_id, item_id, query)
+            return [ReadResourceContents(content=text, mime_type="application/json")]
+        if len(parts) >= 3 and parts[1] == "playbook":
+            session_id = _resolve_session_token(parts[0], active_session)
+            focus = parts[2]
+            text = _playbook_markdown(session_id, focus)
+            return [ReadResourceContents(content=text, mime_type="text/markdown")]
+        raise ValueError(f"Unknown session resource: {uri_text}")
+
+    raise ValueError(f"Unknown resource host: {host}")
+
+
+PROMPTS: dict[str, types.Prompt] = {
+    "logic_orient": types.Prompt(
+        name="logic_orient",
+        title="Orient Before Mutation",
+        description=(
+            "Build a quick understanding of current logic state and choose safe incremental next calls."
+        ),
+        arguments=[
+            types.PromptArgument(name="goal", description="Current problem or objective.", required=False),
+            types.PromptArgument(
+                name="certainty",
+                description="How sure you are about existing model state: low|medium|high.",
+                required=False,
+            ),
+        ],
+    ),
+    "logic_capture_discovery": types.Prompt(
+        name="logic_capture_discovery",
+        title="Capture Discovery",
+        description=(
+            "Translate newly discovered requirements into incremental rule/expectation/context updates."
+        ),
+        arguments=[
+            types.PromptArgument(name="discovery", description="Natural-language discovery to encode.", required=True),
+            types.PromptArgument(name="code_path", description="Optional related source/doc path.", required=False),
+            types.PromptArgument(name="symbols", description="Optional comma-separated symbols.", required=False),
+        ],
+    ),
+    "logic_experiment_loop": types.Prompt(
+        name="logic_experiment_loop",
+        title="What-If Experiment Loop",
+        description="Plan low-risk experiments with hypothesis.patch and gradual detail escalation.",
+        arguments=[
+            types.PromptArgument(name="hypothesis", description="Experiment intent.", required=False),
+            types.PromptArgument(
+                name="detail_level",
+                description="minimal|compact|more|full (defaults to compact).",
+                required=False,
+            ),
+            types.PromptArgument(
+                name="max_iterations",
+                description="Suggested number of small iterations (e.g., 3, 5, 8).",
+                required=False,
+            ),
+        ],
+    ),
+    "logic_graph_handoff": types.Prompt(
+        name="logic_graph_handoff",
+        title="Graph Handoff Review",
+        description="Prepare a high-signal handoff from rules/expectations to concepts/code bindings.",
+        arguments=[
+            types.PromptArgument(name="focus", description="rules|expectations|concepts|code-bindings|all", required=False),
+            types.PromptArgument(name="risk_area", description="Optional subsystem/risk summary.", required=False),
+        ],
+    ),
+}
+
+
+def _prompt_text(name: str, arguments: dict[str, str]) -> tuple[str, str]:
+    if name == "logic_orient":
+        goal = arguments.get("goal", "current task")
+        certainty = arguments.get("certainty", "low")
+        text = "\n".join(
+            [
+                f"Goal: {goal}",
+                f"Certainty about existing model: {certainty}",
+                "",
+                "Use this sequence:",
+                "1. `logic_list` with `{show:[\"all\"], detail_level:\"minimal\"}`.",
+                "2. Retrieve exact items with `logic_list {\"id\":\"...\"}` before edits.",
+                "3. Make one focused mutation at a time.",
+                "4. Validate each mutation via `logic_check` (compact first).",
+                "",
+                "Default bias: look before act unless you are certain state already matches your intent.",
+            ]
+        )
+        return ("Orientation workflow before edits.", text)
+    if name == "logic_capture_discovery":
+        discovery = arguments.get("discovery", "(no discovery text provided)")
+        code_path = arguments.get("code_path", "")
+        symbols = arguments.get("symbols", "")
+        lines = [
+            f"Discovery: {discovery}",
+            "",
+            "Encode incrementally:",
+            "1. Add one rule/bundle reflecting the newly discovered invariant/declaration.",
+            "2. Add expectation only when omission or equivalence risk appears.",
+            "3. Attach concept/code binding links now rather than deferring context work.",
+            "4. Run `logic_check` after each modest step.",
+        ]
+        if symbols:
+            lines.append(f"- Candidate symbols: {symbols}")
+        if code_path:
+            lines.append(f"- Add/patch code binding path: {code_path}")
+        lines.extend(
+            [
+                "",
+                "Prefer multiple small calls over one large payload to keep reasoning and diagnostics sharp.",
+            ]
+        )
+        return ("Convert discoveries into executable structure.", "\n".join(lines))
+    if name == "logic_experiment_loop":
+        hypothesis = arguments.get("hypothesis", "evaluate a candidate change")
+        detail = arguments.get("detail_level", "compact")
+        max_iterations = arguments.get("max_iterations", "5")
+        text = "\n".join(
+            [
+                f"Hypothesis: {hypothesis}",
+                f"Starting detail_level: {detail}",
+                f"Suggested small iterations: {max_iterations}",
+                "",
+                "Experiment loop:",
+                "1. Keep persistent state stable.",
+                "2. Use `logic_check.hypothesis.patch` with one temporary change.",
+                "3. Inspect `breaks`, `delta`, and `expectation_failures`.",
+                "4. Keep, refine, or discard the idea.",
+                "5. Repeat with next small variation.",
+                "",
+                "Escalate to `more`/`full` only when compact output is insufficient.",
+            ]
+        )
+        return ("What-if loop for safe, cheap, exact experimentation.", text)
+    if name == "logic_graph_handoff":
+        focus = arguments.get("focus", "all")
+        risk_area = arguments.get("risk_area", "")
+        lines = [
+            f"Handoff focus: {focus}",
+            "Collect these views:",
+            "1. `logic_list` for `rules` and `expectations` (full).",
+            "2. `logic_list` for `concepts` and `code_bindings` (full).",
+            "3. Specific `logic_list {\"id\":\"...\"}` lookups for critical anchors.",
+            "4. One representative `logic_check` result for active risk context.",
+        ]
+        if risk_area:
+            lines.append(f"Risk area to emphasize: {risk_area}")
+        lines.append("Keep the handoff graph-first and evidence-backed.")
+        return ("Prepare an auditable logic-to-code handoff package.", "\n".join(lines))
+    raise ValueError(f"Unknown prompt '{name}'")
+
+
+@server.list_prompts()
+async def list_prompts(_: types.ListPromptsRequest | None = None) -> types.ListPromptsResult:
+    return types.ListPromptsResult(prompts=list(PROMPTS.values()))
+
+
+@server.get_prompt()
+async def get_prompt(name: str, arguments: dict[str, str] | None) -> types.GetPromptResult:
+    args = arguments or {}
+    description, text = _prompt_text(name, args)
+    return types.GetPromptResult(
+        description=description,
+        messages=[
+            types.PromptMessage(
+                role="assistant",
+                content=types.TextContent(type="text", text=text),
+            )
+        ],
+    )
+
+
+@server.completion()
+async def completion(
+    ref: types.PromptReference | types.ResourceTemplateReference,
+    argument: types.CompletionArgument,
+    context: types.CompletionContext | None,
+) -> types.Completion | None:
+    del context
+    values: list[str] = []
+    name = argument.name
+    current = argument.value
+
+    if isinstance(ref, types.PromptReference):
+        prompt_suggestions: dict[tuple[str, str], list[str]] = {
+            ("logic_orient", "certainty"): ["low", "medium", "high"],
+            ("logic_experiment_loop", "detail_level"): DETAIL_LEVEL_VALUES,
+            ("logic_experiment_loop", "max_iterations"): ["3", "5", "8", "12"],
+            ("logic_graph_handoff", "focus"): ["all", "rules", "expectations", "concepts", "code-bindings"],
+        }
+        values = prompt_suggestions.get((ref.name, name), [])
+    elif isinstance(ref, types.ResourceTemplateReference):
+        if name == "detail_level":
+            values = DETAIL_LEVEL_VALUES
+        elif name == "show":
+            values = LIST_SHOW_VALUES
+        elif name == "focus":
+            values = PLAYBOOK_FOCUS_VALUES
+        elif name == "session_id":
+            session_id = get_namespace_id()
+            values = ["current"] if session_id == "default" else ["current", session_id]
+        elif name == "item_id":
+            session_id = get_namespace_id()
+            try:
+                items = get_engine(session_id).list_items({"show": ["all"], "detail_level": "minimal", "limit": 200})
+                values = sorted(
+                    {
+                        item.get("id")
+                        for item in items.get("result", {}).get("items", [])
+                        if isinstance(item.get("id"), str) and item.get("id")
+                    }
+                )
+            except Exception:
+                values = []
+
+    filtered = _prefixed(values, current)[:30]
+    if not filtered:
+        return None
+    return types.Completion(values=filtered, total=len(filtered), hasMore=False)
 
 
 @server.call_tool()

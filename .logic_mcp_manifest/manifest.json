@@ -4,6 +4,7 @@
   "entrypoint": ".logic_mcp_manifest/manifest.md",
   "references": [
     ".logic_mcp_manifest/examples.md",
+    ".logic_mcp_manifest/use-case-examples.md",
     ".logic_mcp_manifest/AGENTS.snippet.md"
   ],
   "tools": {

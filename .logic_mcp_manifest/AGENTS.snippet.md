@@ -27,9 +27,6 @@ Use it to get an overview of concepts, rules, expectations and source code locat
   - For code changes, run `rg` to locate relevant references and mention what you found.
 
   ## If you wonder if there may be more uses for the Logic MCP tool
-  - Read `.logic_mcp_manifest/examples/inspirations.md`
+  - Read `.logic_mcp_manifest/use-case-examples.md`
 
-  ### If you believe the task is immense and need expert reference for the MCP tool
-  - Note: Token heavy, don't read unless instructed or as last-resort.
-  - Read: `.logic_mcp_manifest/examples/inspirations.md`
 

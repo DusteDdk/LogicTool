@@ -8,6 +8,12 @@ Trigger:
 - Before final claims about compatibility, safety, or edge-case behavior.
 - During thought experiments to find simpler/less-constrained valid solutions.
 
+MCP-native discovery surfaces:
+- `tools/list`: includes tool descriptions, field-level input schemas, output envelopes, and annotations.
+- `resources/list` + `resources/read`: include playbooks, examples, use-case catalog, and session snapshots.
+- `prompts/list` + `prompts/get`: include structured workflows for orientation, discovery capture, experiments, and handoff.
+- `completion/complete`: offers argument suggestions (for example `detail_level`, `show`, and focus values).
+
 Primary tool use:
 - `logic_list`: unified listing for bundles, rules, expectations, concepts, and code bindings.
 - `logic_set_bundle` / `logic_remove_bundle`: maintain persistent SMT2 bundles.
@@ -24,6 +30,12 @@ Quick workflow:
 5. Use `logic_check` for risky changes and what-if thought experiments.
 6. Inspect `breaks`, `delta`, and (at higher detail levels) `expectations`, `unsat_core`, `influence`.
 7. Use `.logic_mcp_manifest/examples.md` for compact request patterns.
+
+Reasoning rhythm (preferred):
+1. Start with `logic_list` at `detail_level:"minimal"` unless state is already certain.
+2. Make one modest mutation at a time (rule, expectation, or context link).
+3. Run `logic_check` with temporary `hypothesis.patch` to experiment freely.
+4. Persist only what survives checks; keep large speculative edits out of persistent state.
 
 Rules:
 - Keep payloads minimal.
