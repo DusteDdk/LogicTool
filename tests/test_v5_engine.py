@@ -33,13 +33,19 @@ class LogicEngineV5Tests(unittest.TestCase):
 
         self.assertEqual(self.engine.set_rule({"id": "r1", "lang": "pyexpr", "rule": "x > 0"}), {"ok": True})
 
-        listed = self.engine.list_items({"show": ["rules"], "detail_level": "full"})
+        listed = self.engine.list_items({"show": ["rules"], "detail_level": "more"})
         self.assertTrue(listed["ok"])
         self.assertEqual(len(listed["result"]["items"]), 1)
         item = listed["result"]["items"][0]
         self.assertEqual(item["id"], "r1")
         self.assertEqual(item["type"], "rule")
-        self.assertIn("content", item)
+        self.assertIn("summary", item)
+        self.assertNotIn("content", item)
+
+        read_item = self.engine.read_item({"id": "r1"})
+        self.assertTrue(read_item["ok"])
+        self.assertEqual(read_item["result"]["item"]["id"], "r1")
+        self.assertIn("content", read_item["result"]["item"])
 
         self.assertEqual(self.engine.remove_rule({"id": "r1"}), {"ok": True})
         listed_after = self.engine.list_items({"show": ["rules"]})
@@ -159,16 +165,19 @@ class LogicEngineV5Tests(unittest.TestCase):
         self.assertTrue(full["ok"])
         self.assertIn("influence", full["result"])
 
-    def test_logic_list_id_mode_and_mutual_exclusion(self) -> None:
+    def test_logic_read_and_list_constraints(self) -> None:
         self.engine.set_rule({"id": "r1", "lang": "pyexpr", "rule": "x > 0"})
 
-        by_id = self.engine.list_items({"id": "r1"})
+        by_id = self.engine.read_item({"id": "r1", "detail_level": "full"})
         self.assertTrue(by_id["ok"])
-        self.assertEqual(len(by_id["result"]["items"]), 1)
-        self.assertEqual(by_id["result"]["items"][0]["id"], "r1")
+        self.assertEqual(by_id["result"]["item"]["id"], "r1")
+        self.assertIn("content", by_id["result"]["item"])
 
         with self.assertRaises(LogicError):
-            self.engine.list_items({"id": "r1", "show": ["rules"]})
+            self.engine.list_items({"id": "r1"})
+
+        with self.assertRaises(LogicError):
+            self.engine.list_items({"detail_level": "full"})
 
 
 if __name__ == "__main__":

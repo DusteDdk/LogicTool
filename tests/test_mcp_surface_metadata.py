@@ -20,6 +20,7 @@ class LogicMcpSurfaceMetadataTests(unittest.TestCase):
         tools = {tool.name: tool for tool in result.tools}
 
         self.assertIn("logic_list", tools)
+        self.assertIn("logic_read", tools)
         self.assertIn("logic_check", tools)
         self.assertIn("logic_context_patch", tools)
 
@@ -29,6 +30,13 @@ class LogicMcpSurfaceMetadataTests(unittest.TestCase):
         self.assertIsNotNone(logic_list.outputSchema)
         self.assertIn("properties", logic_list.inputSchema)
         self.assertIn("detail_level", logic_list.inputSchema["properties"])
+        self.assertNotIn("id", logic_list.inputSchema["properties"])
+        self.assertNotIn("full", logic_list.inputSchema["properties"]["detail_level"]["enum"])
+
+        logic_read = tools["logic_read"]
+        self.assertIsNotNone(logic_read.annotations)
+        self.assertTrue(bool(logic_read.annotations and logic_read.annotations.readOnlyHint))
+        self.assertIn("id", logic_read.inputSchema["properties"])
 
         logic_check = tools["logic_check"]
         self.assertIsNotNone(logic_check.outputSchema)

@@ -90,7 +90,7 @@ Optional environment overrides:
 - `SERVER_PATH`: override server script path
 
 ## Validation Scripts
-- `scripts/integration_test_http.sh`: MCP initialize/call flow, session isolation, compact/full list behavior, and log fidelity.
+- `scripts/integration_test_http.sh`: MCP initialize/call flow, session isolation, list/read behavior, and log fidelity.
 - `scripts/test_audit_parse_error.sh`: strict parse-error logging behavior and JSONL-safe escaped raw body.
 
 ## Agent-facing files
@@ -103,7 +103,7 @@ Files expected at project root after install:
 - `AGENTS.md` (contains the Logic MCP snippet)
 
 ## Tools exposed
-The server exposes 9 tools:
+The server exposes 10 tools:
 - `logic_set_rule`
 - `logic_remove_rule`
 - `logic_set_bundle`
@@ -113,6 +113,7 @@ The server exposes 9 tools:
 - `logic_check`
 - `logic_context_patch`
 - `logic_list`
+- `logic_read`
 
 `tools/list` includes:
 - tool `title` and long-form `description`
@@ -133,8 +134,8 @@ Beyond tools, the server exposes:
   - `logic://session/current/snapshot`
   - `logic://session/current/playbook`
 - `resources/templates/list`:
-  - `logic://session/{session_id}/inventory/{detail_level}` (optional query: `show`, `limit`, `cursor`)
-  - `logic://session/{session_id}/item/{item_id}` (optional query: `detail_level`)
+  - `logic://session/{session_id}/inventory/{detail_level}` (`detail_level` is `minimal|compact|more`; optional query: `show`, `limit`, `cursor`)
+  - `logic://session/{session_id}/item/{item_id}` (optional query: `detail_level`, including `full`)
   - `logic://session/{session_id}/playbook/{focus}`
 - `prompts/list` / `prompts/get`:
   - `logic_orient`
@@ -226,7 +227,15 @@ MCP already carries tool name, so the simplest payloads do not need a `tool` fie
 }
 ```
 
-Single-ID lookup:
+### `logic_read`
+```json
+{
+  "id": "sim_start_exact",
+  "detail_level": "full"
+}
+```
+
+Minimal single-ID lookup:
 ```json
 {
   "id": "sim_start_exact"
@@ -244,7 +253,8 @@ All tools return:
 3. Add omission checks with `logic_set_expectation`.
 4. Add context links with `logic_context_patch`.
 5. Run what-if checks via `logic_check` with temporary patch/facts overlays.
-6. Inspect compact/full inventories via `logic_list`.
+6. Inspect inventories via `logic_list` (`minimal|compact|more`).
+7. Read specific IDs in detail via `logic_read` (use `full` when needed).
 
 ## Compliance notes
 The accepted reduced-surface contract is documented in `context-feature-spec.md`.

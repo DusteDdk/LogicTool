@@ -1451,23 +1451,7 @@ class LogicEngine:
             )
         return self._strip_empty({"id": item_id, "type": "code_binding", **payload})
 
-    def list_items(self, args: dict) -> dict:
-        detail_level = args.get("detail_level", "compact")
-        if detail_level not in {"minimal", "compact", "more", "full"}:
-            raise LogicError("E_INVALID_REQUEST", "detail_level must be one of minimal|compact|more|full")
-        show = args.get("show")
-        item_id = args.get("id")
-        cursor = args.get("cursor")
-        limit_raw = args.get("limit", 50)
-        if not isinstance(limit_raw, int) or limit_raw < 1:
-            raise LogicError("E_INVALID_REQUEST", "limit must be an integer >= 1")
-        limit = limit_raw
-
-        if show is not None and item_id is not None:
-            raise LogicError("E_INVALID_REQUEST", "id and show are mutually exclusive")
-        if item_id is not None and not isinstance(item_id, str):
-            raise LogicError("E_INVALID_REQUEST", "id must be a string")
-
+    def _item_universe(self) -> Dict[str, tuple[str, dict]]:
         self._ensure_context_root(self.store.data)
         active_bundles = self.store.get_active_items("bundles")
         active_rules = self.store.get_active_items("rules")
@@ -1486,15 +1470,36 @@ class LogicEngine:
             universe[key] = ("concept", value)
         for key, value in bindings.items():
             universe[key] = ("code_binding", value)
+        return universe
 
-        if item_id is not None:
-            if item_id not in universe:
-                raise LogicError("E_UNKNOWN_ID", "id does not exist", {"id": item_id})
-            entry_type, payload = universe[item_id]
-            level = args.get("detail_level", "full")
-            if level not in {"minimal", "compact", "more", "full"}:
-                raise LogicError("E_INVALID_REQUEST", "detail_level must be one of minimal|compact|more|full")
-            return {"ok": True, "result": {"items": [self._render_list_item(entry_type, item_id, payload, level)]}}
+    def read_item(self, args: dict) -> dict:
+        item_id = args.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            raise LogicError("E_INVALID_REQUEST", "Missing required field id")
+
+        detail_level = args.get("detail_level", "full")
+        if detail_level not in ITEM_DETAIL_LEVEL_VALUES:
+            raise LogicError("E_INVALID_REQUEST", "detail_level must be one of minimal|compact|more|full")
+
+        universe = self._item_universe()
+        if item_id not in universe:
+            raise LogicError("E_UNKNOWN_ID", "id does not exist", {"id": item_id})
+        entry_type, payload = universe[item_id]
+        return {"ok": True, "result": {"item": self._render_list_item(entry_type, item_id, payload, detail_level)}}
+
+    def list_items(self, args: dict) -> dict:
+        detail_level = args.get("detail_level", "compact")
+        if detail_level not in LIST_DETAIL_LEVEL_VALUES:
+            raise LogicError("E_INVALID_REQUEST", "detail_level must be one of minimal|compact|more")
+        show = args.get("show")
+        cursor = args.get("cursor")
+        limit_raw = args.get("limit", 50)
+        if not isinstance(limit_raw, int) or limit_raw < 1:
+            raise LogicError("E_INVALID_REQUEST", "limit must be an integer >= 1")
+        limit = limit_raw
+
+        if "id" in args:
+            raise LogicError("E_INVALID_REQUEST", "logic_list does not support id; use logic_read")
 
         valid_show = {"all", "bundles", "rules", "expectations", "concepts", "code_bindings"}
         if show is None:
@@ -1510,17 +1515,26 @@ class LogicEngine:
         if "all" in normalized_show:
             normalized_show = ["bundles", "rules", "expectations", "concepts", "code_bindings"]
 
+        universe = self._item_universe()
         selected: List[tuple[str, str, dict]] = []
         if "bundles" in normalized_show:
-            selected.extend(("bundle", item_id, payload) for item_id, payload in active_bundles.items())
+            selected.extend((item_type, item_id, payload) for item_id, (item_type, payload) in universe.items() if item_type == "bundle")
         if "rules" in normalized_show:
-            selected.extend(("rule", item_id, payload) for item_id, payload in active_rules.items())
+            selected.extend((item_type, item_id, payload) for item_id, (item_type, payload) in universe.items() if item_type == "rule")
         if "expectations" in normalized_show:
-            selected.extend(("expectation", item_id, payload) for item_id, payload in active_expectations.items())
+            selected.extend(
+                (item_type, item_id, payload)
+                for item_id, (item_type, payload) in universe.items()
+                if item_type == "expectation"
+            )
         if "concepts" in normalized_show:
-            selected.extend(("concept", item_id, payload) for item_id, payload in concepts.items())
+            selected.extend((item_type, item_id, payload) for item_id, (item_type, payload) in universe.items() if item_type == "concept")
         if "code_bindings" in normalized_show:
-            selected.extend(("code_binding", item_id, payload) for item_id, payload in bindings.items())
+            selected.extend(
+                (item_type, item_id, payload)
+                for item_id, (item_type, payload) in universe.items()
+                if item_type == "code_binding"
+            )
 
         selected.sort(key=lambda item: item[1])
         start = 0
@@ -2387,6 +2401,8 @@ server = Server("logic-tool-server", version="1.0")
 
 
 DETAIL_LEVEL_VALUES = ["minimal", "compact", "more", "full"]
+LIST_DETAIL_LEVEL_VALUES = ["minimal", "compact", "more"]
+ITEM_DETAIL_LEVEL_VALUES = ["minimal", "compact", "more", "full"]
 LIST_SHOW_VALUES = ["all", "bundles", "rules", "expectations", "concepts", "code_bindings"]
 RULE_LANG_VALUES = ["pyexpr", "smt2"]
 EXPECTATION_KIND_VALUES = ["entails", "equivalent"]
@@ -2505,9 +2521,10 @@ def _session_snapshot_markdown(session_id: str) -> str:
         "",
         "## Suggested Next Calls",
         "1. `logic_list` with `detail_level:\"minimal\"` and narrow `show` filters.",
-        "2. Add or update one rule/expectation/context item at a time.",
-        "3. Run `logic_check` with a temporary `hypothesis.patch` for experiments.",
-        "4. Escalate to `detail_level:\"more\"|\"full\"` only when diagnostics are needed.",
+        "2. Inspect one item deeply with `logic_read` when needed.",
+        "3. Add or update one rule/expectation/context item at a time.",
+        "4. Run `logic_check` with a temporary `hypothesis.patch` for experiments.",
+        "5. Escalate list detail to `more` and use `logic_read` for full item detail.",
     ]
     return "\n".join(lines)
 
@@ -2541,7 +2558,7 @@ def _item_resource_json(session_id: str, item_id: str, query: dict[str, list[str
     detail_values = query.get("detail_level")
     if detail_values and detail_values[0]:
         detail_level = detail_values[0]
-    result = get_engine(session_id).list_items({"id": item_id, "detail_level": detail_level})
+    result = get_engine(session_id).read_item({"id": item_id, "detail_level": detail_level})
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
@@ -2556,7 +2573,7 @@ def _playbook_markdown(session_id: str, focus: str) -> str:
     sections: dict[str, list[str]] = {
         "onboarding": [
             "1. Call `logic_list` with `show:[\"all\"]`, `detail_level:\"minimal\"`.",
-            "2. Fetch specific IDs with `logic_list {\"id\":\"...\"}` before modifying.",
+            "2. Fetch specific IDs with `logic_read {\"id\":\"...\"}` before modifying.",
             "3. Capture discovered invariants with `logic_set_rule` in small independent units.",
             "4. Attach context links incrementally with `logic_context_patch`.",
         ],
@@ -2569,7 +2586,7 @@ def _playbook_markdown(session_id: str, focus: str) -> str:
         "experiment": [
             "1. Keep persistent state stable; use `logic_check.hypothesis.patch` for trial ideas.",
             "2. Try one patch at a time and inspect `breaks`, `delta`, `expectation_failures`.",
-            "3. Start with `detail_level:\"compact\"`; escalate to `more` or `full` only on demand.",
+            "3. Start with `detail_level:\"compact\"`; escalate to `more` and use `logic_read` for full item detail.",
             "4. Persist only the experiments that survived checks.",
         ],
         "hygiene": [
@@ -2580,7 +2597,7 @@ def _playbook_markdown(session_id: str, focus: str) -> str:
         ],
         "handoff": [
             "1. Export focused inventories (`rules`,`expectations`,`concepts`,`code_bindings`).",
-            "2. Provide key ID lookups (`logic_list {\"id\":\"...\"}`) for critical nodes.",
+            "2. Provide key ID lookups (`logic_read {\"id\":\"...\"}`) for critical nodes.",
             "3. Attach one recent `logic_check` result that explains current breakage risk.",
             "4. Include what-if candidates as temporary patch snippets, not persisted edits.",
         ],
@@ -2653,6 +2670,18 @@ def _logic_tools() -> list[types.Tool]:
             },
         },
         "required": ["items"],
+        "additionalProperties": False,
+    }
+    read_result_schema = {
+        "type": "object",
+        "properties": {
+            "item": {
+                "type": "object",
+                "description": "Single inventory item resolved by global ID.",
+                "additionalProperties": True,
+            }
+        },
+        "required": ["item"],
         "additionalProperties": False,
     }
     check_result_schema = {
@@ -2985,7 +3014,7 @@ def _logic_tools() -> list[types.Tool]:
         name="logic_list",
         title="List Inventory",
         description=(
-            "Unified list/lookup across bundles, rules, expectations, concepts, and code bindings. "
+            "List inventory across bundles, rules, expectations, concepts, and code bindings. "
             "Use this first to orient before mutation unless certainty is high."
         ),
         properties={
@@ -2994,13 +3023,9 @@ def _logic_tools() -> list[types.Tool]:
                 "description": "Item categories to include. Defaults to ['all'].",
                 "items": {"type": "string", "enum": LIST_SHOW_VALUES},
             },
-            "id": {
-                "type": "string",
-                "description": "Fetch one item by global ID. Mutually exclusive with show.",
-            },
             "detail_level": {
                 "type": "string",
-                "enum": DETAIL_LEVEL_VALUES,
+                "enum": LIST_DETAIL_LEVEL_VALUES,
                 "default": "compact",
                 "description": "Response detail/cost level.",
             },
@@ -3023,7 +3048,37 @@ def _logic_tools() -> list[types.Tool]:
         output_schema=_tool_response_schema(list_result_schema),
         meta={
             "use_cases": ["orientation", "pre_edit_scan", "dependency_review", "handoff"],
-            "workflow_hint": "Start minimal, then inspect specific IDs at full detail.",
+            "workflow_hint": "Start minimal, escalate list detail to more, then use logic_read for full item detail.",
+        },
+    )
+    add_tool(
+        name="logic_read",
+        title="Read Item",
+        description=(
+            "Read one inventory item by global ID with optional full detail."
+        ),
+        properties={
+            "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Global item ID to read.",
+            },
+            "detail_level": {
+                "type": "string",
+                "enum": ITEM_DETAIL_LEVEL_VALUES,
+                "default": "full",
+                "description": "Item detail level.",
+            },
+        },
+        required=["id"],
+        read_only=True,
+        destructive=False,
+        idempotent=True,
+        open_world=False,
+        output_schema=_tool_response_schema(read_result_schema),
+        meta={
+            "use_cases": ["single_item_lookup", "deep_inspection", "handoff_anchor_review"],
+            "workflow_hint": "Use after logic_list identifies the target ID.",
         },
     )
 
@@ -3131,7 +3186,7 @@ async def list_resource_templates() -> list[types.ResourceTemplate]:
             title="Session Inventory",
             uriTemplate="logic://session/{session_id}/inventory/{detail_level}",
             description=(
-                "Machine-readable inventory snapshot. Optional query params: show=rules,expectations "
+                "Machine-readable inventory snapshot (detail_level=minimal|compact|more). Optional query params: show=rules,expectations "
                 "& limit=50 & cursor=0."
             ),
             mimeType="application/json",
@@ -3179,10 +3234,11 @@ async def read_resource(uri: Any) -> Iterable[ReadResourceContents]:
                     "",
                     "## Core Operating Pattern",
                     "1. Orient with `logic_list` before mutations unless certainty is high.",
-                    "2. Add structure incrementally: bundles/rules/expectations/context as discoveries appear.",
-                    "3. Use temporary `logic_check.hypothesis.patch` for experiments.",
-                    "4. Prefer many modest calls over one large speculative construction.",
-                    "5. Persist only the pieces that survive checks.",
+                    "2. Use `logic_read` for deep inspection of specific IDs.",
+                    "3. Add structure incrementally: bundles/rules/expectations/context as discoveries appear.",
+                    "4. Use temporary `logic_check.hypothesis.patch` for experiments.",
+                    "5. Prefer many modest calls over one large speculative construction.",
+                    "6. Persist only the pieces that survive checks.",
                     "",
                     "## Why This Pattern",
                     "- Faster: each call has lower cognitive and token cost.",
@@ -3198,7 +3254,7 @@ async def read_resource(uri: Any) -> Iterable[ReadResourceContents]:
                     "",
                     "## Look Before Act",
                     "- Run `logic_list` with minimal detail first.",
-                    "- Pull full detail only for IDs you plan to touch.",
+                    "- Pull full detail only for IDs you plan to touch using `logic_read`.",
                     "",
                     "## Capture As You Discover",
                     "- New invariant: `logic_set_rule`.",
@@ -3209,10 +3265,10 @@ async def read_resource(uri: Any) -> Iterable[ReadResourceContents]:
                     "## Experiment Freely",
                     "- Keep persistent graph stable.",
                     "- Use `logic_check` with hypothesis facts/patch for trial ideas.",
-                    "- Compare compact outputs quickly; escalate detail only when needed.",
+                    "- Compare compact outputs quickly; escalate list detail to `more` and inspect IDs with `logic_read` when needed.",
                     "",
                     "## Suggested Loop",
-                    "1. list -> 2. one focused change -> 3. check -> 4. keep/revert idea -> 5. repeat",
+                    "1. list -> 2. read target IDs -> 3. one focused change -> 4. check -> 5. keep/revert idea -> 6. repeat",
                 ]
             )
             return [ReadResourceContents(content=text, mime_type="text/markdown")]
@@ -3348,7 +3404,7 @@ def _prompt_text(name: str, arguments: dict[str, str]) -> tuple[str, str]:
                 "",
                 "Use this sequence:",
                 "1. `logic_list` with `{show:[\"all\"], detail_level:\"minimal\"}`.",
-                "2. Retrieve exact items with `logic_list {\"id\":\"...\"}` before edits.",
+                "2. Retrieve exact items with `logic_read {\"id\":\"...\"}` before edits.",
                 "3. Make one focused mutation at a time.",
                 "4. Validate each mutation via `logic_check` (compact first).",
                 "",
@@ -3397,7 +3453,7 @@ def _prompt_text(name: str, arguments: dict[str, str]) -> tuple[str, str]:
                 "4. Keep, refine, or discard the idea.",
                 "5. Repeat with next small variation.",
                 "",
-                "Escalate to `more`/`full` only when compact output is insufficient.",
+                "Escalate to `more` first; use `logic_read` for full item detail when compact output is insufficient.",
             ]
         )
         return ("What-if loop for safe, cheap, exact experimentation.", text)
@@ -3407,9 +3463,9 @@ def _prompt_text(name: str, arguments: dict[str, str]) -> tuple[str, str]:
         lines = [
             f"Handoff focus: {focus}",
             "Collect these views:",
-            "1. `logic_list` for `rules` and `expectations` (full).",
-            "2. `logic_list` for `concepts` and `code_bindings` (full).",
-            "3. Specific `logic_list {\"id\":\"...\"}` lookups for critical anchors.",
+            "1. `logic_list` for `rules` and `expectations` (more).",
+            "2. `logic_list` for `concepts` and `code_bindings` (more).",
+            "3. Specific `logic_read {\"id\":\"...\", \"detail_level\":\"full\"}` lookups for critical anchors.",
             "4. One representative `logic_check` result for active risk context.",
         ]
         if risk_area:
@@ -3459,8 +3515,13 @@ async def completion(
         }
         values = prompt_suggestions.get((ref.name, name), [])
     elif isinstance(ref, types.ResourceTemplateReference):
+        ref_name = getattr(ref, "name", "")
+        ref_uri = str(getattr(ref, "uriTemplate", "") or getattr(ref, "uri", ""))
         if name == "detail_level":
-            values = DETAIL_LEVEL_VALUES
+            if ref_name == "logic_session_item" or "/item/" in ref_uri:
+                values = ITEM_DETAIL_LEVEL_VALUES
+            else:
+                values = LIST_DETAIL_LEVEL_VALUES
         elif name == "show":
             values = LIST_SHOW_VALUES
         elif name == "focus":
@@ -3541,6 +3602,7 @@ async def call_tool(name: str, arguments: dict | None) -> dict:
         "logic_remove_expectation": engine.remove_expectation,
         "logic_context_patch": engine.context_patch,
         "logic_list": engine.list_items,
+        "logic_read": engine.read_item,
         "logic_check": engine.check_v5,
     }
     content_mutation_tools = {

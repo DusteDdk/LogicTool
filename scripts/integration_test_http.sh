@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # End-to-end smoke test for the HTTP-only Logic MCP server (v5 surface).
-# Validates MCP flow, per-session isolation, unified list behavior, context patch,
+# Validates MCP flow, per-session isolation, list/read behavior, context patch,
 # and log fidelity.
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -85,16 +85,22 @@ call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":2,"method":"tools/call","
 call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"logic_set_rule","arguments":{"id":"rule-a","lang":"pyexpr","rule":"x > 0"}}}' /tmp/itest_a_set_rule.txt
 call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"logic_set_expectation","arguments":{"id":"exp-a","kind":"entails","a_ref":"rule-a","b_ref":"rule-a"}}}' /tmp/itest_a_set_expect.txt
 call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"logic_context_patch","arguments":{"ops":[{"op":"set_code_binding","id":"cb-a","set":{"path":"src/a.py","related_rule_ids":["rule-a"],"related_expectation_ids":[],"related_concept_ids":[]}}]}}}' /tmp/itest_a_context_patch.txt
-call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"logic_list","arguments":{"show":["all"],"detail_level":"full"}}}' /tmp/itest_a_list_full.txt
-call_tool "$SESSION_B" "$MCP_B" '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"logic_list"}}' /tmp/itest_b_list.txt
+call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"logic_list","arguments":{"show":["all"],"detail_level":"more"}}}' /tmp/itest_a_list_more.txt
+call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"logic_read","arguments":{"id":"rule-a","detail_level":"full"}}}' /tmp/itest_a_read_rule.txt
+call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"logic_list","arguments":{"detail_level":"full"}}}' /tmp/itest_a_list_full_rejected.txt
+call_tool "$SESSION_B" "$MCP_B" '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"logic_list"}}' /tmp/itest_b_list.txt
 
 rg -q '"structuredContent":\{"ok":true,"result":\{"items":\[\]\}\}' /tmp/itest_a_list.txt
 rg -q '"structuredContent":\{"ok":true\}' /tmp/itest_a_set_rule.txt
 rg -q '"structuredContent":\{"ok":true\}' /tmp/itest_a_set_expect.txt
 rg -q '"structuredContent":\{"ok":true\}' /tmp/itest_a_context_patch.txt
-rg -q '"type":"rule"' /tmp/itest_a_list_full.txt
-rg -q '"id":"rule-a"' /tmp/itest_a_list_full.txt
-rg -q '"type":"code_binding"' /tmp/itest_a_list_full.txt
+rg -q '"type":"rule"' /tmp/itest_a_list_more.txt
+rg -q '"id":"rule-a"' /tmp/itest_a_list_more.txt
+rg -q '"type":"code_binding"' /tmp/itest_a_list_more.txt
+rg -q '"structuredContent":\{"ok":true,"result":\{"item":' /tmp/itest_a_read_rule.txt
+rg -q '"id":"rule-a"' /tmp/itest_a_read_rule.txt
+rg -q '"content":"x > 0"' /tmp/itest_a_read_rule.txt
+rg -q "Input validation error: 'full' is not one of \\['minimal', 'compact', 'more'\\]" /tmp/itest_a_list_full_rejected.txt
 rg -q '"structuredContent":\{"ok":true,"result":\{"items":\[\]\}\}' /tmp/itest_b_list.txt
 
 [[ -f "$LOG_A" ]] && [[ -f "$LOG_B" ]]

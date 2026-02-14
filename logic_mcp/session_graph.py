@@ -161,7 +161,7 @@ def build_session_graph_svg(session_id: str) -> str | None:
 
 def _render_svg(session_id: str, nodes: list[GraphNode], edges: list[GraphEdge]) -> str | None:
     width = 1200
-    height = 700
+    height = 1200
     header_h = 56
     footer_h = 20
 
