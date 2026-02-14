@@ -1,0 +1,19 @@
+---
+description: Large codebase exploration and change strategy
+alwaysApply: true
+---
+
+# Large Codebase Strategy
+
+- Start broad, then narrow quickly to relevant directories and symbols.
+- Build a lightweight map: entry points, data flow, ownership boundaries.
+- Avoid reading many full files early; search first, then open only candidates.
+- Prefer scoped edits that preserve module boundaries.
+- For cross-cutting changes, sequence by dependency order and verify each step.
+
+# Exploration Pattern
+
+1. Locate affected surfaces.
+2. Confirm call path and side effects.
+3. Change one surface at a time.
+4. Re-check integration points after each surface.

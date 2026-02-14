@@ -1,0 +1,26 @@
+---
+description: Practical defaults for using Logic MCP incrementally
+alwaysApply: true
+---
+
+# Logic MCP Workflow
+
+- Treat MCP tool behavior and these `.cursor/rules/` files as the only guidance source.
+- Prefer incremental model building: bundles, then rules, then expectations.
+- Keep IDs stable and descriptive (`b_*`, `r_*`, `e_*`, `c_*`, `cb_*`).
+- Use `logic_check` frequently as a what-if guard during refactors.
+- Favor temporary hypothesis patches for experiments over mutating baseline state.
+- Update concepts and code bindings whenever understanding changes.
+
+# Dependency Safety
+
+- Before removing a rule, check expectations that reference it.
+- Before removing a concept, clear code binding references first.
+- Use list calls with explicit detail levels for fast orientation.
+
+# Refactor Guard Pattern
+
+1. Baseline `logic_check`.
+2. Candidate patch (`remove_rules` etc.).
+3. Inspect newly failed expectations and counterexamples.
+4. Decide whether to proceed, adjust logic, or back out.

@@ -1,0 +1,17 @@
+---
+description: Safe editing and change-control defaults
+alwaysApply: true
+---
+
+# Edit Safety
+
+- Do not revert unrelated local changes unless explicitly requested.
+- Do not run destructive git operations without explicit user approval.
+- Preserve existing style and architecture unless task requires change.
+- Keep diffs focused; avoid unrelated cleanup in the same pass.
+- When behavior changes, add or update tests close to the change.
+
+# Validation
+
+- Run lint/test checks after substantive edits when feasible.
+- If checks cannot run, state exactly what remains to verify.

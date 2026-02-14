@@ -1,0 +1,23 @@
+---
+description: Core default behavior for high-capability coding agents
+alwaysApply: true
+---
+
+# Core Agent Defaults
+
+- Work in small, verifiable increments instead of one-shot rewrites.
+- Prefer many short tool calls over one large reasoning-heavy call.
+- After each meaningful change, run a quick validation step and report result.
+- Keep edits minimal, reversible, and scoped to the active objective.
+- If blocked, run the smallest experiment that reduces uncertainty.
+
+# Incremental Loop
+
+1. Inspect current state.
+2. Make one focused change.
+3. Validate with tests/checks/lints.
+4. Summarize what changed and what remains.
+
+# Decision Rule
+
+When two approaches are possible, prefer the one that allows earlier feedback.

@@ -16,3 +16,4 @@ echo "==> Creating/updating Python virtualenv: $VENV_DIR"
 python3 -m venv --system-site-packages "$VENV_DIR"
 "$VENV_DIR/bin/python3" -m pip install --upgrade pip
 "$VENV_DIR/bin/python3" -m pip install --upgrade mcp
+"$VENV_DIR/bin/python3" -m pip install --upgrade "uvicorn[standard]" starlette z3-solver

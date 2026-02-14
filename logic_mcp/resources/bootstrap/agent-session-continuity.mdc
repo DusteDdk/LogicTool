@@ -1,0 +1,18 @@
+---
+description: Maintain continuity across long-running and multi-session work
+alwaysApply: true
+---
+
+# Session Continuity
+
+- Write short progress notes after each major milestone.
+- Track open risks, assumptions, and next concrete action.
+- Prefer checkpoint-style commits only when requested by the user.
+- Resume by re-validating current state before continuing planned steps.
+
+# Handoff Format
+
+- Objective: one sentence.
+- Done: concrete completed steps.
+- Next: immediate actionable next step.
+- Risks: unresolved uncertainty or dependency.

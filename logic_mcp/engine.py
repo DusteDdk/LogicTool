@@ -25,6 +25,10 @@ from mcp.server.lowlevel.server import request_ctx
 from .audit_log import append_tool_log, build_tool_call_payload
 from .errors import LogicError
 from .store import Store
+from .supervisor import INTERCEPT_STAGE_CALL
+from .supervisor import INTERCEPT_STAGE_REPLY
+from .supervisor import SUPERVISOR
+from .supervisor import new_event_payload_for_log
 
 DEFAULT_TIMEOUT_MS = 2000
 INFLUENCE_BUDGET = 20
@@ -3026,6 +3030,20 @@ def _logic_tools() -> list[types.Tool]:
     return tools
 
 
+_TOOL_OUTPUT_SCHEMAS: dict[str, dict[str, Any] | None] | None = None
+
+
+def get_tool_output_schema(tool_name: str) -> dict[str, Any] | None:
+    global _TOOL_OUTPUT_SCHEMAS
+    if _TOOL_OUTPUT_SCHEMAS is None:
+        schemas: dict[str, dict[str, Any] | None] = {}
+        for tool in _logic_tools():
+            output_schema = getattr(tool, "outputSchema", None)
+            schemas[tool.name] = output_schema if isinstance(output_schema, dict) else None
+        _TOOL_OUTPUT_SCHEMAS = schemas
+    return _TOOL_OUTPUT_SCHEMAS.get(tool_name)
+
+
 @server.list_tools()
 async def list_tools(_: types.ListToolsRequest | None = None) -> types.ListToolsResult:
     return types.ListToolsResult(tools=_logic_tools())
@@ -3475,17 +3493,44 @@ async def call_tool(name: str, arguments: dict | None) -> dict:
     args = arguments or {}
     session_id = get_namespace_id()
     request = None
+    ctx = None
     try:
         ctx = request_ctx.get()
         request = getattr(ctx, "request", None)
     except LookupError:
         request = None
+        ctx = None
+    if ctx is not None:
+        session_obj = getattr(ctx, "session", None)
+        if session_obj is not None:
+            await SUPERVISOR.register_active_session(session_id, session_obj)
     call_payload = await build_tool_call_payload(
         request,
         name,
         arguments,
         strict_raw_call_logging=STRICT_RAW_CALL_LOGGING,
     )
+    output_schema = get_tool_output_schema(name)
+    mode = await SUPERVISOR.get_mode(session_id)
+    if SUPERVISOR.mode_matches_stage(mode, INTERCEPT_STAGE_CALL):
+        pending = await SUPERVISOR.create_pending(
+            session_id=session_id,
+            stage=INTERCEPT_STAGE_CALL,
+            tool_name=name,
+            call_payload=call_payload,
+            tool_arguments=args if isinstance(args, dict) else {},
+            output_schema=output_schema,
+            tool_response=None,
+        )
+        action, payload = await SUPERVISOR.wait_for_decision(pending.intercept_id)
+        if action == "override" and isinstance(payload, dict) and isinstance(payload.get("response"), dict):
+            response = payload["response"]
+            entry = append_tool_log(session_id, call_payload, response)
+            if entry is not None:
+                await SUPERVISOR.publish("session_log", new_event_payload_for_log(session_id, entry))
+            return response
+        if isinstance(payload, dict) and isinstance(payload.get("arguments"), dict):
+            args = payload["arguments"]
     engine = get_engine(session_id)
     handlers = {
         "logic_set_rule": engine.set_rule,
@@ -3498,6 +3543,15 @@ async def call_tool(name: str, arguments: dict | None) -> dict:
         "logic_list": engine.list_items,
         "logic_check": engine.check_v5,
     }
+    content_mutation_tools = {
+        "logic_set_rule",
+        "logic_remove_rule",
+        "logic_set_bundle",
+        "logic_remove_bundle",
+        "logic_set_expectation",
+        "logic_remove_expectation",
+        "logic_context_patch",
+    }
     response: dict
     try:
         handler = handlers.get(name)
@@ -3505,11 +3559,36 @@ async def call_tool(name: str, arguments: dict | None) -> dict:
             response = {"ok": False, "error": {"code": "E_INVALID_REQUEST", "message": f"Unknown tool {name}"}}
         else:
             response = handler(args)
+            if (
+                name in content_mutation_tools
+                and isinstance(response, dict)
+                and response.get("ok") is True
+            ):
+                try:
+                    await SUPERVISOR.publish_session_graph_updated(session_id)
+                except Exception:
+                    # Graph updates must not block tool responses.
+                    pass
     except LogicError as exc:
         response = {"ok": False, "error": {"code": exc.code, "message": exc.message}}
         if exc.details:
             response["error"]["details"] = exc.details
     except Exception as exc:
         response = {"ok": False, "error": {"code": "E_SOLVER_ERROR", "message": str(exc)}}
-    append_tool_log(session_id, call_payload, response)
+    if SUPERVISOR.mode_matches_stage(mode, INTERCEPT_STAGE_REPLY):
+        pending = await SUPERVISOR.create_pending(
+            session_id=session_id,
+            stage=INTERCEPT_STAGE_REPLY,
+            tool_name=name,
+            call_payload=call_payload,
+            tool_arguments=args if isinstance(args, dict) else {},
+            output_schema=output_schema,
+            tool_response=response,
+        )
+        action, payload = await SUPERVISOR.wait_for_decision(pending.intercept_id)
+        if action == "send" and isinstance(payload, dict) and isinstance(payload.get("response"), dict):
+            response = payload["response"]
+    entry = append_tool_log(session_id, call_payload, response)
+    if entry is not None:
+        await SUPERVISOR.publish("session_log", new_event_payload_for_log(session_id, entry))
     return response

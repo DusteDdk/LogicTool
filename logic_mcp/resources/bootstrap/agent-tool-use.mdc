@@ -1,0 +1,17 @@
+---
+description: Tool orchestration defaults for efficient autonomous work
+alwaysApply: true
+---
+
+# Tool Use Defaults
+
+- Prefer specialized tools over shell for reading, searching, and edits.
+- Run independent queries in parallel; keep dependent operations sequential.
+- Use short feedback cycles for long-running commands and observe output early.
+- Capture key command outcomes in concise notes for continuity.
+- Avoid speculative heavy operations when a cheap probe can answer first.
+
+# Reliability Rules
+
+- Treat tool errors as signals; adjust request shape and retry minimally.
+- Confirm assumptions with a direct read/search call before large edits.

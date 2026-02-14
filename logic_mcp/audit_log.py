@@ -136,19 +136,19 @@ async def build_tool_call_payload(
     return payload
 
 
-def append_tool_log(session_id: str, call_payload: Any, response_payload: Any) -> None:
-    line = _to_log_json(
-        {
-            "time": _log_timestamp(),
-            "call": call_payload,
-            "response": response_payload,
-        }
-    ) + "\n"
+def append_tool_log(session_id: str, call_payload: Any, response_payload: Any) -> dict[str, Any] | None:
+    entry = {
+        "time": _log_timestamp(),
+        "call": call_payload,
+        "response": response_payload,
+    }
+    line = _to_log_json(entry) + "\n"
     log_file = _session_log_file(session_id)
     try:
         with LOG_LOCK:
             with log_file.open("a", encoding="utf-8") as f:
                 f.write(line)
+        return entry
     except Exception:
         # Logging must never block tool execution.
-        pass
+        return None
