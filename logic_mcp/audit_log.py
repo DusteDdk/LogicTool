@@ -136,12 +136,20 @@ async def build_tool_call_payload(
     return payload
 
 
-def append_tool_log(session_id: str, call_payload: Any, response_payload: Any) -> dict[str, Any] | None:
+def append_tool_log(
+    session_id: str,
+    call_payload: Any,
+    response_payload: Any,
+    *,
+    request_duration_ms: int | None = None,
+) -> dict[str, Any] | None:
     entry = {
         "time": _log_timestamp(),
         "call": call_payload,
         "response": response_payload,
     }
+    if request_duration_ms is not None:
+        entry["request_duration_ms"] = max(0, int(request_duration_ms))
     line = _to_log_json(entry) + "\n"
     log_file = _session_log_file(session_id)
     try:

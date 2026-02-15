@@ -10,7 +10,7 @@ from typing import Any
 
 from .audit_log import _safe_session_log_name
 from .paths import STORE_DIR
-from .session_graph import build_session_graph_svg
+from .session_graph import build_session_graph_table
 from .store import sanitize_namespace
 
 INTERCEPT_DISABLED = "disabled"
@@ -333,32 +333,32 @@ class SupervisorCoordinator:
             except asyncio.QueueFull:
                 continue
 
-    async def get_session_graph_svg(self, session_id: str) -> str | None:
+    async def get_session_graph_table(self, session_id: str) -> dict[str, Any] | None:
         safe = sanitize_namespace(session_id)
         try:
-            return build_session_graph_svg(safe)
+            return build_session_graph_table(safe)
         except Exception:
             return None
 
-    async def get_graphs_by_session(self, session_ids: list[str]) -> dict[str, str]:
-        out: dict[str, str] = {}
+    async def get_graphs_by_session(self, session_ids: list[str]) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
         for session_id in session_ids:
             if isinstance(session_id, str) and session_id:
-                svg = await self.get_session_graph_svg(session_id)
-                if isinstance(svg, str) and svg.strip():
-                    out[session_id] = svg
+                table = await self.get_session_graph_table(session_id)
+                if isinstance(table, dict):
+                    out[session_id] = table
         return out
 
     async def publish_session_graph_updated(self, session_id: str) -> None:
         safe = sanitize_namespace(session_id)
-        svg = await self.get_session_graph_svg(safe)
-        if not isinstance(svg, str) or not svg.strip():
+        table = await self.get_session_graph_table(safe)
+        if not isinstance(table, dict):
             return
         await self.publish(
             "session_graph_updated",
             {
                 "session_id": safe,
-                "svg": svg,
+                "table": table,
             },
         )
 

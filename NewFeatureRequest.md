@@ -1,10 +1,4 @@
-# IMPORTANT
-- DO NOT EDIT ANY OTHER FILES YET!
-
-# Prompt
-- ONLY UPDATE THE ICONS in the Examples section!
-
-# Feature request: Better Log
+# Feature request: Better Dashboard Log
 Update the supervisor dashboard per-session log:
 - Remove the expandable card.
 
@@ -23,17 +17,32 @@ Lines for a tool-response should follow this template:
 "<ToolCallResult> <Reply_symbol> <LogicResult> <itemId> <requestDuration> <JSON_log_line>
 
 
-Examples:
+# Examples
+
 - logic_set_rule:
-  - Call: 💾 🛡️ 📜 _no-air-control_ <COMPACT_JSON_LOG_ENTRY>
-  - Reply: 🟩 🔁 🛡️  🎉 214ms <COMPACT_JSON_LOG_ENTRY>
-logic_remove_rule:
+  - Call: 💾 🛡️ 🐍 _no-air-control_ <COMPACT_JSON_LOG_ENTRY>
+  - Reply: ✅ 🔁 ⏺️ _no-air-control_ 214ms <COMPACT_JSON_LOG_ENTRY>
+- logic_remove_rule:
   - Call: 🗑️ 🛡️ 🆔 _no-air-control_ <COMPACT_JSON_LOG_ENTRY>
-  - Reply:🟩 🔁 ⏺️ 10ms <COMPACT_JSON_LOG_ENTRY>
-logic_set_bundle
-logic_remove_bundle
-logic_set_expectation
-logic_remove_expectation
-logic_check
-logic_context_patch
-logic_list
+  - Reply: ✅ 🔁 ⏺️ _no-air-control_ 10ms <COMPACT_JSON_LOG_ENTRY>
+- logic_set_bundle:
+  - Call: 💾 📦 📜 _decl-collision_ <COMPACT_JSON_LOG_ENTRY>
+  - Reply: ✅ 🔁 🎉 _decl-collision_ 12ms <COMPACT_JSON_LOG_ENTRY>
+- logic_remove_bundle:
+  - Call: 🗑️ 📦 🆔 _decl-collision_ <COMPACT_JSON_LOG_ENTRY>
+  - Reply: ✅ 🔁 ⏺️ _decl-collision_ 9ms <COMPACT_JSON_LOG_ENTRY>
+- logic_set_expectation:
+  - Call: 💾 🎯 🧾 _exp-grounded-uses-normals_ <COMPACT_JSON_LOG_ENTRY>
+  - Reply: ✅ 🔁 🎉 _exp-grounded-uses-normals_ 18ms <COMPACT_JSON_LOG_ENTRY>
+- logic_remove_expectation:
+  - Call: 🗑️ 🎯 🆔 _exp-grounded-uses-normals_ <COMPACT_JSON_LOG_ENTRY>
+  - Reply: ✅ 🔁 ⏺️ _exp-grounded-uses-normals_ 7ms <COMPACT_JSON_LOG_ENTRY>
+- logic_check:
+  - Call: 🧪 🔧 🤔 _hypothesis_ <COMPACT_JSON_LOG_ENTRY>
+  - Reply: ✅ 🔁 💥 _hypothesis_ 26ms <COMPACT_JSON_LOG_ENTRY>
+- logic_context_patch:
+  - Call: 💾 🧬 🆔 _c_slope_grounding_ <COMPACT_JSON_LOG_ENTRY>
+  - Reply: ✅ 🔁 ⏺️ _c_slope_grounding_ 15ms <COMPACT_JSON_LOG_ENTRY>
+- logic_list:
+  - Call: 👀 🔧 🔧 _none_ <COMPACT_JSON_LOG_ENTRY>
+  - Reply: ✅ 🔁 ⏺️ _none_ 6ms <COMPACT_JSON_LOG_ENTRY>

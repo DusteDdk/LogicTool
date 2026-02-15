@@ -90,13 +90,17 @@ h1 {
 
 .log-panel {
   background: #f8fafc;
-  border: 1px solid #d9e1e8;
-  border-radius: 6px;
-  padding: 10px;
-  margin-bottom: 10px;
+  border-top: 1px solid #d5dde7;
+  border-bottom: 1px solid #d5dde7;
+  border-left: 0;
+  border-right: 0;
+  margin-top: 10px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 0;
 }
 
-.graph-svg-wrap {
+.graph-table-wrap {
   width: 100%;
   margin-bottom: 12px;
   overflow: auto;
@@ -105,16 +109,44 @@ h1 {
   background: #ffffff;
 }
 
-.graph-svg-wrap svg {
+.graph-table {
   width: 100%;
-  height: auto;
-  display: block;
+  min-width: 640px;
+  border-collapse: collapse;
 }
 
-.log-panel summary {
-  cursor: pointer;
-  font-weight: bold;
-  margin-bottom: 8px;
+.graph-table th,
+.graph-table td {
+  border-bottom: 1px solid #e5ebf2;
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+  font-size: 0.84rem;
+}
+
+.graph-table th {
+  font-weight: 600;
+  color: #334155;
+  background: #f8fafc;
+}
+
+.graph-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.graph-table-empty {
+  text-align: center;
+  color: #64748b;
+}
+
+.graph-type-cell {
+  white-space: nowrap;
+}
+
+.graph-outgoing-cell {
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: clip;
 }
 
 .mono {
@@ -122,14 +154,21 @@ h1 {
   font-size: 0.86rem;
 }
 
-.log-entry-card {
-  background: #ffffff;
-  border: 1px solid #d9e1e8;
-  border-radius: 4px;
-  padding: 8px;
-  margin-top: 8px;
-  white-space: pre-wrap;
-  word-break: break-word;
+.log-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  overflow: hidden;
+}
+
+.log-line {
+  padding: 0 10px;
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: clip;
+  line-height: 1.35;
+  user-select: text;
 }
 
 pre {

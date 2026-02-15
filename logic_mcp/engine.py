@@ -3551,6 +3551,7 @@ async def completion(
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict | None) -> dict:
+    request_started = time.perf_counter()
     args = arguments or {}
     session_id = get_namespace_id()
     request = None
@@ -3586,7 +3587,13 @@ async def call_tool(name: str, arguments: dict | None) -> dict:
         action, payload = await SUPERVISOR.wait_for_decision(pending.intercept_id)
         if action == "override" and isinstance(payload, dict) and isinstance(payload.get("response"), dict):
             response = payload["response"]
-            entry = append_tool_log(session_id, call_payload, response)
+            duration_ms = int((time.perf_counter() - request_started) * 1000)
+            entry = append_tool_log(
+                session_id,
+                call_payload,
+                response,
+                request_duration_ms=duration_ms,
+            )
             if entry is not None:
                 await SUPERVISOR.publish("session_log", new_event_payload_for_log(session_id, entry))
             return response
@@ -3650,7 +3657,13 @@ async def call_tool(name: str, arguments: dict | None) -> dict:
         action, payload = await SUPERVISOR.wait_for_decision(pending.intercept_id)
         if action == "send" and isinstance(payload, dict) and isinstance(payload.get("response"), dict):
             response = payload["response"]
-    entry = append_tool_log(session_id, call_payload, response)
+    duration_ms = int((time.perf_counter() - request_started) * 1000)
+    entry = append_tool_log(
+        session_id,
+        call_payload,
+        response,
+        request_duration_ms=duration_ms,
+    )
     if entry is not None:
         await SUPERVISOR.publish("session_log", new_event_payload_for_log(session_id, entry))
     return response

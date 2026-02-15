@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import html
-import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,18 +22,10 @@ class GraphEdge:
     label: str
 
 
-NODE_COLORS = {
-    "bundle": "#4f46e5",
-    "rule": "#0ea5e9",
-    "expectation": "#f59e0b",
-    "concept": "#10b981",
-    "code_binding": "#8b5cf6",
-}
-
 TYPE_ORDER = ["bundle", "rule", "expectation", "concept", "code_binding"]
 
 
-def build_session_graph_svg(session_id: str) -> str | None:
+def build_session_graph_table(session_id: str) -> dict[str, Any] | None:
     safe_session_id = sanitize_namespace(session_id)
     store = Store(safe_session_id)
     data = store.data if isinstance(store.data, dict) else {}
@@ -156,92 +146,47 @@ def build_session_graph_svg(session_id: str) -> str | None:
             if isinstance(ref, str) and ref in nodes:
                 edges.append(GraphEdge(source_id=item_id, target_id=ref, label="related_concept"))
 
-    return _render_svg(safe_session_id, list(nodes.values()), edges)
+    return _render_table(safe_session_id, list(nodes.values()), edges)
 
 
-def _render_svg(session_id: str, nodes: list[GraphNode], edges: list[GraphEdge]) -> str | None:
-    width = 1200
-    height = 1200
-    header_h = 56
-    footer_h = 20
+def _type_sort_key(node_type: str) -> int:
+    if node_type in TYPE_ORDER:
+        return TYPE_ORDER.index(node_type)
+    return len(TYPE_ORDER)
 
-    by_type: dict[str, list[GraphNode]] = {node_type: [] for node_type in TYPE_ORDER}
-    for node in sorted(nodes, key=lambda n: (TYPE_ORDER.index(n.node_type), n.node_id)):
-        by_type[node.node_type].append(node)
-    row_spacing = 95
-    max_rows = max(1, max(len(items) for items in by_type.values()))
-    content_height = max(1, height - header_h - footer_h)
-    row_spacing = min(row_spacing, max(1, int(content_height / max_rows)))
-    column_spacing = int(width / (len(TYPE_ORDER) + 1))
 
-    positions: dict[str, tuple[float, float]] = {}
-    for idx, node_type in enumerate(TYPE_ORDER):
-        items = by_type[node_type]
-        if not items:
-            continue
-        x = (idx + 1) * column_spacing
-        top_pad = header_h + 22
-        if len(items) > 1:
-            y_step = (height - top_pad - 32) / (len(items) - 1)
-            for i, node in enumerate(items):
-                positions[node.node_id] = (float(x), float(top_pad + i * y_step))
-        else:
-            positions[items[0].node_id] = (float(x), float((top_pad + height - 32) / 2))
-
-    degrees: dict[str, int] = {node.node_id: 0 for node in nodes}
-    for edge in edges:
-        if edge.source_id in degrees:
-            degrees[edge.source_id] += 1
-        if edge.target_id in degrees:
-            degrees[edge.target_id] += 1
-
-    svg: list[str] = []
-    svg.append(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" preserveAspectRatio="xMidYMid meet" role="img">')
-    svg.append("<defs>")
-    svg.append(
-        "<marker id='arrow' markerWidth='12' markerHeight='8' refX='10' refY='4' orient='auto' markerUnits='strokeWidth'>"
-        "<path d='M0,0 L12,4 L0,8 z' fill='#94a3b8'/></marker>"
-    )
-    svg.append("</defs>")
-    svg.append(f"<rect x='1' y='1' width='{width - 2}' height='{height - 2}' rx='6' ry='6' fill='#ffffff' stroke='#d1d5db'/>")
-    svg.append(f"<text x='18' y='30' font-size='17' fill='#111827'>Session graph: {html.escape(session_id)}</text>")
-    if not nodes:
-        svg.append(
-            f"<text x='{width / 2:.2f}' y='{height / 2:.2f}' text-anchor='middle' dominant-baseline='middle' "
-            "font-size='24' fill='#6b7280'>[no logic]</text>"
-        )
+def _render_table(session_id: str, nodes: list[GraphNode], edges: list[GraphEdge]) -> dict[str, Any]:
+    node_ids = {node.node_id for node in nodes}
+    outgoing: dict[str, list[dict[str, str]]] = {node.node_id: [] for node in nodes}
+    incoming_count: dict[str, int] = {node.node_id: 0 for node in nodes}
+    seen_edges: set[tuple[str, str, str]] = set()
 
     for edge in edges:
-        src = positions.get(edge.source_id)
-        dst = positions.get(edge.target_id)
-        if src is None or dst is None:
+        label = edge.label if isinstance(edge.label, str) else ""
+        key = (edge.source_id, edge.target_id, label)
+        if key in seen_edges:
             continue
-        x1, y1 = src
-        x2, y2 = dst
-        svg.append(
-            f"<line x1='{x1:.2f}' y1='{y1:.2f}' x2='{x2:.2f}' y2='{y2:.2f}' stroke='#94a3b8' stroke-width='1.5' marker-end='url(#arrow)'/>"
-        )
-        mid_x = (x1 + x2) / 2
-        mid_y = (y1 + y2) / 2
-        label = html.escape(edge.label)
-        if label:
-            svg.append(f"<text x='{mid_x:.2f}' y='{mid_y - 4:.2f}' font-size='10' fill='#6b7280'>{label}</text>")
+        seen_edges.add(key)
+        if edge.source_id not in node_ids or edge.target_id not in node_ids:
+            continue
+        outgoing[edge.source_id].append({"label": label, "target_id": edge.target_id})
+        incoming_count[edge.target_id] += 1
 
-    for node in nodes:
-        pos = positions.get(node.node_id)
-        if pos is None:
-            continue
-        x, y = pos
-        degree = degrees.get(node.node_id, 0)
-        radius = 16 + min(16, math.sqrt(max(0, degree)) * 4)
-        color = NODE_COLORS.get(node.node_type, "#64748b")
-        tooltip = html.escape("\n".join([node.label, f"type: {node.node_type}", f"direct_refs: {degree}", *node.details]))
-        text = html.escape(node.label if len(node.label) <= 30 else f"{node.label[:27]}...")
-        svg.append(
-            f"<g><circle cx='{x:.2f}' cy='{y:.2f}' r='{radius:.2f}' fill='{color}' fill-opacity='0.86' stroke='#1f2937' stroke-width='1'>"
-            f"<title>{tooltip}</title></circle>"
-            f"<text x='{x:.2f}' y='{y + radius + 14:.2f}' text-anchor='middle' font-size='11' fill='#111827'>{text}</text></g>"
+    rows: list[dict[str, Any]] = []
+    for node in sorted(nodes, key=lambda n: (_type_sort_key(n.node_type), n.node_id)):
+        relations = outgoing.get(node.node_id, [])
+        relations.sort(key=lambda rel: (str(rel.get("label", "")), str(rel.get("target_id", ""))))
+        rows.append(
+            {
+                "type": node.node_type,
+                "id": node.node_id,
+                "outgoing_relations": relations,
+                "incoming_relations_count": incoming_count.get(node.node_id, 0),
+            }
         )
 
-    svg.append("</svg>")
-    return "".join(svg)
+    return {
+        "session_id": session_id,
+        "row_count": len(rows),
+        "rows": rows,
+    }

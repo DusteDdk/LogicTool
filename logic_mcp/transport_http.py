@@ -30,6 +30,7 @@ from .supervisor import read_recent_logs
 SUPERVISOR_ASSETS_DIR = PROJECT_ROOT / "logic_mcp" / "resources" / "supervisor"
 BOOTSTRAP_DIR = PROJECT_ROOT / "logic_mcp" / "resources" / "bootstrap"
 LOG_LEVELS = {"debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"}
+LOG_WINDOW_SIZE = 10
 
 
 class StreamableHTTPASGIApp:
@@ -74,10 +75,10 @@ def create_http_app(server: Any) -> Starlette:
     async def api_session_logs(request: Request) -> JSONResponse:
         session_id = sanitize_namespace(request.path_params["session_id"])
         try:
-            raw = request.query_params.get("limit", "15")
+            raw = request.query_params.get("limit", str(LOG_WINDOW_SIZE))
             limit = max(1, min(200, int(raw)))
         except Exception:
-            limit = 15
+            limit = LOG_WINDOW_SIZE
         logs = read_recent_logs(session_id, limit=limit)
         pending = await SUPERVISOR.get_pending_for_session(session_id)
         mode = await SUPERVISOR.get_mode(session_id)
@@ -264,7 +265,7 @@ async def _build_ws_snapshot() -> dict[str, Any]:
         session_id = row.get("session_id")
         if isinstance(session_id, str):
             session_ids.append(session_id)
-            logs_by_session[session_id] = read_recent_logs(session_id, limit=15)
+            logs_by_session[session_id] = read_recent_logs(session_id, limit=LOG_WINDOW_SIZE)
     graphs_by_session = await SUPERVISOR.get_graphs_by_session(session_ids)
     return {"sessions": sessions, "logs_by_session": logs_by_session, "graphs_by_session": graphs_by_session}
 
