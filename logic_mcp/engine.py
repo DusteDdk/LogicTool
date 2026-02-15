@@ -1862,7 +1862,10 @@ class LogicEngine:
     def list_items(self, args: dict) -> dict:
         detail_level = args.get("detail_level", "compact")
         if detail_level not in LIST_DETAIL_LEVEL_VALUES:
-            raise LogicError("E_INVALID_REQUEST", "detail_level must be one of minimal|compact|more")
+            raise LogicError(
+                "E_INVALID_REQUEST",
+                "detail_level must be one of minimal|compact|more; use logic_read with detail_level=full for one item",
+            )
         show = args.get("show")
         cursor = args.get("cursor")
         limit_raw = args.get("limit", 50)
