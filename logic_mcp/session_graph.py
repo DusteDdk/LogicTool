@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +14,11 @@ class GraphNode:
     node_type: str
     label: str
     details: list[str]
+    version: int | None = None
+    created_at: float | None = None
+    content_lang: str | None = None
+    content_value: Any = None
+    content_bytes: int = 0
 
 
 @dataclass
@@ -23,6 +29,63 @@ class GraphEdge:
 
 
 TYPE_ORDER = ["bundle", "rule", "expectation", "concept", "code_binding"]
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except Exception:
+            return None
+    return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except Exception:
+            return None
+    return None
+
+
+def _json_bytes_len(value: Any) -> int:
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+    except Exception:
+        encoded = json.dumps(str(value), ensure_ascii=False, separators=(",", ":"))
+    return len(encoded.encode("utf-8"))
+
+
+def _content_payload_for_node(node_type: str, payload: dict[str, Any]) -> tuple[str | None, Any]:
+    if node_type in {"bundle", "rule", "expectation"}:
+        lang = payload.get("lang") if isinstance(payload.get("lang"), str) else None
+        return lang, payload.get("content")
+    if node_type == "concept":
+        return "meaning", payload.get("meaning")
+    if node_type == "code_binding":
+        content: dict[str, Any] = {
+            "path": payload.get("path"),
+            "kind": payload.get("kind", "source"),
+            "from": payload.get("from"),
+            "to": payload.get("to"),
+        }
+        if payload.get("line_excerpt"):
+            content["line_excerpt"] = payload.get("line_excerpt")
+        if payload.get("symbols_used"):
+            content["symbols_used"] = payload.get("symbols_used")
+        return "source_code", content
+    return None, None
 
 
 def build_session_graph_table(session_id: str) -> dict[str, Any] | None:
@@ -40,26 +103,43 @@ def build_session_graph_table(session_id: str) -> dict[str, Any] | None:
     edges: list[GraphEdge] = []
 
     for item_id, payload in active_bundles.items():
+        content_lang, content_value = _content_payload_for_node("bundle", payload)
         nodes[item_id] = GraphNode(
             node_id=item_id,
             node_type="bundle",
             label=item_id,
             details=[f"type: bundle", f"lang: {payload.get('lang', '')}".strip()],
+            version=_coerce_int(payload.get("version")),
+            created_at=_coerce_float(payload.get("created_at")),
+            content_lang=content_lang,
+            content_value=content_value,
+            content_bytes=_json_bytes_len(content_value),
         )
 
     for item_id, payload in active_rules.items():
-        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
         details = [f"type: rule", f"lang: {payload.get('lang', '')}".strip()]
-        title = meta.get("title")
-        if isinstance(title, str) and title:
-            details.append(f"title: {title}")
-        nodes[item_id] = GraphNode(node_id=item_id, node_type="rule", label=item_id, details=details)
+        intent = payload.get("intent")
+        if isinstance(intent, str) and intent:
+            details.append(f"intent: {intent}")
+        content_lang, content_value = _content_payload_for_node("rule", payload)
+        nodes[item_id] = GraphNode(
+            node_id=item_id,
+            node_type="rule",
+            label=item_id,
+            details=details,
+            version=_coerce_int(payload.get("version")),
+            created_at=_coerce_float(payload.get("created_at")),
+            content_lang=content_lang,
+            content_value=content_value,
+            content_bytes=_json_bytes_len(content_value),
+        )
 
     for item_id, payload in active_expectations.items():
         content = payload.get("content") if isinstance(payload.get("content"), dict) else {}
         kind = content.get("kind")
         a_ref = content.get("a_ref")
         b_ref = content.get("b_ref")
+        content_lang, content_value = _content_payload_for_node("expectation", payload)
         nodes[item_id] = GraphNode(
             node_id=item_id,
             node_type="expectation",
@@ -70,6 +150,11 @@ def build_session_graph_table(session_id: str) -> dict[str, Any] | None:
                 f"a_ref: {a_ref}" if isinstance(a_ref, str) else "a_ref: unknown",
                 f"b_ref: {b_ref}" if isinstance(b_ref, str) else "b_ref: unknown",
             ],
+            version=_coerce_int(payload.get("version")),
+            created_at=_coerce_float(payload.get("created_at")),
+            content_lang=content_lang,
+            content_value=content_value,
+            content_bytes=_json_bytes_len(content_value),
         )
         if isinstance(a_ref, str) and isinstance(b_ref, str) and a_ref in nodes and b_ref in nodes:
             edge_label = f"expects:{kind}" if isinstance(kind, str) and kind else "expects"
@@ -80,6 +165,7 @@ def build_session_graph_table(session_id: str) -> dict[str, Any] | None:
             continue
         concept_name = payload.get("concept")
         meaning = payload.get("meaning")
+        content_lang, content_value = _content_payload_for_node("concept", payload)
         nodes[item_id] = GraphNode(
             node_id=item_id,
             node_type="concept",
@@ -89,6 +175,11 @@ def build_session_graph_table(session_id: str) -> dict[str, Any] | None:
                 f"concept: {concept_name}" if isinstance(concept_name, str) else "concept: unknown",
                 f"meaning: {meaning}" if isinstance(meaning, str) else "meaning: unknown",
             ],
+            version=_coerce_int(payload.get("version")),
+            created_at=_coerce_float(payload.get("created_at")),
+            content_lang=content_lang,
+            content_value=content_value,
+            content_bytes=_json_bytes_len(content_value),
         )
 
     for item_id, payload in code_bindings.items():
@@ -96,29 +187,23 @@ def build_session_graph_table(session_id: str) -> dict[str, Any] | None:
             continue
         path = payload.get("path")
         kind = payload.get("kind", "source")
-        behavior = payload.get("function_or_behavior")
         details = [
             "type: code_binding",
             f"path: {path}" if isinstance(path, str) else "path: unknown",
             f"kind: {kind}" if isinstance(kind, str) else "kind: source",
         ]
-        if isinstance(behavior, str) and behavior:
-            details.append(f"behavior: {behavior}")
+        content_lang, content_value = _content_payload_for_node("code_binding", payload)
         nodes[item_id] = GraphNode(
             node_id=item_id,
             node_type="code_binding",
             label=item_id,
             details=details,
+            version=_coerce_int(payload.get("version")),
+            created_at=_coerce_float(payload.get("created_at")),
+            content_lang=content_lang,
+            content_value=content_value,
+            content_bytes=_json_bytes_len(content_value),
         )
-
-    for item_id, payload in active_rules.items():
-        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-        bundle_ids = meta.get("bundle_ids")
-        if not isinstance(bundle_ids, list):
-            continue
-        for bundle_id in bundle_ids:
-            if isinstance(bundle_id, str) and item_id in nodes and bundle_id in nodes:
-                edges.append(GraphEdge(source_id=item_id, target_id=bundle_id, label="uses_bundle"))
 
     for item_id, payload in concepts.items():
         if not isinstance(payload, dict) or item_id not in nodes:
@@ -158,6 +243,7 @@ def _type_sort_key(node_type: str) -> int:
 def _render_table(session_id: str, nodes: list[GraphNode], edges: list[GraphEdge]) -> dict[str, Any]:
     node_ids = {node.node_id for node in nodes}
     outgoing: dict[str, list[dict[str, str]]] = {node.node_id: [] for node in nodes}
+    incoming: dict[str, list[dict[str, str]]] = {node.node_id: [] for node in nodes}
     incoming_count: dict[str, int] = {node.node_id: 0 for node in nodes}
     seen_edges: set[tuple[str, str, str]] = set()
 
@@ -170,17 +256,26 @@ def _render_table(session_id: str, nodes: list[GraphNode], edges: list[GraphEdge
         if edge.source_id not in node_ids or edge.target_id not in node_ids:
             continue
         outgoing[edge.source_id].append({"label": label, "target_id": edge.target_id})
+        incoming[edge.target_id].append({"label": label, "source_id": edge.source_id})
         incoming_count[edge.target_id] += 1
 
     rows: list[dict[str, Any]] = []
     for node in sorted(nodes, key=lambda n: (_type_sort_key(n.node_type), n.node_id)):
         relations = outgoing.get(node.node_id, [])
         relations.sort(key=lambda rel: (str(rel.get("label", "")), str(rel.get("target_id", ""))))
+        incoming_relations = incoming.get(node.node_id, [])
+        incoming_relations.sort(key=lambda rel: (str(rel.get("label", "")), str(rel.get("source_id", ""))))
         rows.append(
             {
                 "type": node.node_type,
                 "id": node.node_id,
+                "version": node.version,
+                "created_at": node.created_at,
+                "content_lang": node.content_lang,
+                "content_value": node.content_value,
+                "content_bytes": node.content_bytes,
                 "outgoing_relations": relations,
+                "incoming_relations": incoming_relations,
                 "incoming_relations_count": incoming_count.get(node.node_id, 0),
             }
         )

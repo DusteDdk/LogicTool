@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import re
 import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
 
 from .paths import STORE_DIR
+from .store import sanitize_namespace
 
 LOG_LOCK = threading.Lock()
 MAX_RAW_BODY_CHARS = 20000
@@ -28,14 +28,15 @@ def _to_log_json(value: Any) -> str:
 
 
 def _safe_session_log_name(session_id: str) -> str:
-    safe_session_id = re.sub(r"[^a-zA-Z0-9_.-]", "_", session_id) or "default"
+    safe_session_id = sanitize_namespace(session_id)
     if safe_session_id in (".", ".."):
         return "default"
     return safe_session_id
 
 
 def _session_log_file(session_id: str) -> Path:
-    return STORE_DIR / f"{_safe_session_log_name(session_id)}_log.jsonl"
+    safe = _safe_session_log_name(session_id)
+    return STORE_DIR / safe / "log.jsonl"
 
 
 def _raw_body_to_text(raw_body: bytes) -> str:
@@ -154,6 +155,7 @@ def append_tool_log(
     log_file = _session_log_file(session_id)
     try:
         with LOG_LOCK:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
             with log_file.open("a", encoding="utf-8") as f:
                 f.write(line)
         return entry

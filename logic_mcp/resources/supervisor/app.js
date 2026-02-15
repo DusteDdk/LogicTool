@@ -1,14 +1,22 @@
 (function () {
+  const sidecarsEl = document.getElementById("sidecars");
   const sessionsEl = document.getElementById("sessions");
-  const expanded = new Set();
   const LOG_ENTRY_WINDOW_SIZE = 10;
   const ICONS = {
+    software: {
+      sidecar: "🏎️",
+      idle: "🤷‍♂️",
+      tentative: "⌛",
+      attached: "🤓",
+      disconnected: "⚫"
+    },
     operation: {
       read: "👁️",
       list: "👀",
       set: "💾",
       remove: "🗑️",
-      test: "🧪"
+      test: "🧪",
+      reset: "🧹"
     },
     item: {
       symbol: "🔣",
@@ -23,6 +31,7 @@
       pyexpr: "🐍",
       smt2: "📜",
       expect: "🧾",
+      meaning: "📔",
       unknownWithId: "💬",
       idOnly: "🆔",
       none: "🔧",
@@ -32,15 +41,30 @@
       sat: "🎉",
       unsat: "💥",
       ok: "✅",
-      failure: "❌",
-      none: "⏺️"
-    },
-    reply: "🔁"
+      failure: "❌"
+    }
   };
   const state = {
+    sidecars: [],
     sessions: [],
     logsBySession: {},
-    graphsBySession: {}
+    graphsBySession: {},
+    pausedLogBySession: {},
+    expandedSessionById: {},
+    contentModal: null,
+    sidecarOutputByInstance: {}
+  };
+  const view = {
+    sidecars: {
+      list: null,
+      empty: null,
+      cardsById: {}
+    },
+    sessions: {
+      list: null,
+      empty: null,
+      cardsById: {}
+    }
   };
 
   function fmtCallsPerSecond(value, secondsAgo) {
@@ -206,6 +230,97 @@
     });
   }
 
+  async function removeSessionData(sessionId) {
+    return api("/supervisor/api/sessions/" + encodeURIComponent(sessionId), {
+      method: "DELETE"
+    });
+  }
+
+  async function resetSessionData(sessionId, wipeLogs) {
+    return api("/supervisor/api/sessions/" + encodeURIComponent(sessionId) + "/reset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ wipe_logs: !!wipeLogs })
+    });
+  }
+
+  async function submitSidecarCommand(instanceId, command, args) {
+    return api("/supervisor/api/sidecars/" + encodeURIComponent(instanceId) + "/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        command: command,
+        args: args || {}
+      })
+    });
+  }
+
+  function canShowRemoveSession(session) {
+    if (session && typeof session.can_remove_session === "boolean") {
+      return session.can_remove_session;
+    }
+    return true;
+  }
+
+  function removeSessionFromState(sessionId) {
+    state.sessions = state.sessions.filter(function (session) {
+      return session && session.session_id !== sessionId;
+    });
+    delete state.logsBySession[sessionId];
+    delete state.graphsBySession[sessionId];
+    delete state.pausedLogBySession[sessionId];
+    delete state.expandedSessionById[sessionId];
+  }
+
+  function trimLogEntries(entries) {
+    if (!Array.isArray(entries)) {
+      return [];
+    }
+    const cleaned = entries.filter(function (entry) {
+      return !!entry && typeof entry === "object";
+    });
+    return cleaned.slice(-LOG_ENTRY_WINDOW_SIZE);
+  }
+
+  function getPausedLogState(sessionId) {
+    const existing = state.pausedLogBySession[sessionId];
+    if (existing && typeof existing === "object") {
+      return existing;
+    }
+    const created = {
+      paused: false,
+      buffer: []
+    };
+    state.pausedLogBySession[sessionId] = created;
+    return created;
+  }
+
+  function togglePauseLogs(sessionId) {
+    const control = getPausedLogState(sessionId);
+    if (!control.paused) {
+      control.paused = true;
+      control.buffer = trimLogEntries(state.logsBySession[sessionId]);
+    } else {
+      control.paused = false;
+      control.buffer = [];
+    }
+    renderSessionsFromState();
+  }
+
+  function visibleLogsForSession(sessionId) {
+    const control = state.pausedLogBySession[sessionId];
+    if (control && control.paused) {
+      return trimLogEntries(control.buffer);
+    }
+    return trimLogEntries(state.logsBySession[sessionId]);
+  }
+
+  function pushSessionLogEntry(sessionId, entry) {
+    const currentLive = trimLogEntries(state.logsBySession[sessionId]);
+    currentLive.push(entry);
+    state.logsBySession[sessionId] = trimLogEntries(currentLive);
+  }
+
   function compactJsonLine(value) {
     try {
       return JSON.stringify(value);
@@ -218,6 +333,15 @@
     return (value && typeof value === "object") ? value : {};
   }
 
+  function isSessionExpanded(sessionId) {
+    return !!state.expandedSessionById[sessionId];
+  }
+
+  function toggleSessionExpanded(sessionId) {
+    state.expandedSessionById[sessionId] = !isSessionExpanded(sessionId);
+    renderSessionsFromState();
+  }
+
   function getCallName(entry) {
     const call = asObject(entry && entry.call);
     return typeof call.name === "string" ? call.name : "";
@@ -226,6 +350,16 @@
   function getCallArguments(entry) {
     const call = asObject(entry && entry.call);
     return asObject(call.arguments);
+  }
+
+  function shortToolName(callName) {
+    if (typeof callName !== "string" || !callName) {
+      return "_unknown_";
+    }
+    if (callName.indexOf("logic_") === 0) {
+      return callName.slice("logic_".length) || callName;
+    }
+    return callName;
   }
 
   function getPrimaryContextOp(args) {
@@ -267,16 +401,32 @@
       return "_hypothesis_";
     }
     if (callName === "logic_list") {
-      return "_none_";
+      const show = Array.isArray(args.show) ? args.show.filter(function (item) { return typeof item === "string" && item; }) : [];
+      if (show.length > 0) {
+        return show.join("|");
+      }
+      return "all";
     }
     if (callName === "logic_context_patch") {
       const primaryOp = getPrimaryContextOp(args);
       if (primaryOp && typeof primaryOp.id === "string" && primaryOp.id) {
         return primaryOp.id;
       }
+      if (primaryOp && typeof primaryOp.op === "string" && primaryOp.op) {
+        return primaryOp.op;
+      }
     }
     if (typeof args.id === "string" && args.id) {
       return args.id;
+    }
+    if (typeof args.query === "string" && args.query) {
+      return args.query;
+    }
+    if (typeof args.search === "string" && args.search) {
+      return args.search;
+    }
+    if (typeof args.focus === "string" && args.focus) {
+      return args.focus;
     }
     return "_none_";
   }
@@ -290,6 +440,9 @@
     }
     if (callName === "logic_check") {
       return ICONS.operation.test;
+    }
+    if (callName === "logic_reset") {
+      return ICONS.operation.reset;
     }
     if (callName === "logic_context_patch") {
       const primaryOp = getPrimaryContextOp(args);
@@ -326,12 +479,6 @@
       if (opName.indexOf("code_binding") !== -1) {
         return ICONS.item.binding;
       }
-      if (opName.indexOf("rule_meta") !== -1) {
-        return ICONS.item.rule;
-      }
-      if (opName.indexOf("expectation_meta") !== -1) {
-        return ICONS.item.expectation;
-      }
       return ICONS.item.symbol;
     }
     if (callName === "logic_read") {
@@ -340,13 +487,13 @@
       const item = asObject(result.item);
       return iconForItemType(item.type);
     }
-    if (callName === "logic_list" || callName === "logic_check") {
+    if (callName === "logic_list" || callName === "logic_check" || callName === "logic_reset") {
       return ICONS.item.none;
     }
     return ICONS.item.symbol;
   }
 
-  function inferLanguageIcon(callName, args, itemId) {
+  function inferLanguageIcon(callName, args, itemId, entry) {
     if (callName === "logic_check") {
       return ICONS.language.hypothesis;
     }
@@ -355,6 +502,31 @@
     }
     if (callName === "logic_set_expectation") {
       return ICONS.language.expect;
+    }
+    if (callName === "logic_context_patch") {
+      const primaryOp = getPrimaryContextOp(args);
+      const opName = primaryOp && typeof primaryOp.op === "string" ? primaryOp.op : "";
+      if (opName.indexOf("concept") !== -1) {
+        return ICONS.language.meaning;
+      }
+    }
+    if (callName === "logic_read") {
+      const response = asObject(entry && entry.response);
+      const result = asObject(response.result);
+      const item = asObject(result.item);
+      if (item.type === "concept") {
+        return ICONS.language.meaning;
+      }
+      const itemLang = typeof item.lang === "string" ? item.lang : "";
+      if (itemLang === "pyexpr") {
+        return ICONS.language.pyexpr;
+      }
+      if (itemLang === "smt2") {
+        return ICONS.language.smt2;
+      }
+      if (itemLang === "expect") {
+        return ICONS.language.expect;
+      }
     }
     const hasId = typeof itemId === "string" && itemId !== "_none_";
     const lang = typeof args.lang === "string" ? args.lang : "";
@@ -377,11 +549,7 @@
   }
 
   function inferLogicResultIcon(entry) {
-    const callName = getCallName(entry);
     const response = asObject(entry && entry.response);
-    if (response.ok === true && (callName === "logic_set_bundle" || callName === "logic_set_expectation")) {
-      return ICONS.result.sat;
-    }
     const result = asObject(response.result);
     const statuses = [];
     if (typeof result.status === "string") {
@@ -403,7 +571,7 @@
         return ICONS.result.unsat;
       }
     }
-    return ICONS.result.none;
+    return "";
   }
 
   function requestDurationMs(entry) {
@@ -415,25 +583,28 @@
     return 0;
   }
 
-  function formatCallLogLine(entry) {
+  function buildLogParts(entry) {
     const callName = getCallName(entry);
     const args = getCallArguments(entry);
     const itemId = inferItemId(callName, args);
     const operation = inferOperationIcon(callName, args);
     const tool = inferToolIcon(callName, args, entry);
-    const language = inferLanguageIcon(callName, args, itemId);
-    return operation + " " + tool + " " + language + " " + itemId + " " + compactJsonLine(entry);
-  }
-
-  function formatReplyLogLine(entry) {
-    const callName = getCallName(entry);
-    const args = getCallArguments(entry);
-    const itemId = inferItemId(callName, args);
+    const language = inferLanguageIcon(callName, args, itemId, entry);
+    const shortName = shortToolName(callName);
     const response = asObject(entry && entry.response);
-    const result = response.ok === true ? ICONS.result.ok : ICONS.result.failure;
+    const toolCallResult = response.ok === true ? ICONS.result.ok : ICONS.result.failure;
     const logicResult = inferLogicResultIcon(entry);
     const duration = requestDurationMs(entry) + "ms";
-    return result + " " + ICONS.reply + " " + logicResult + " " + itemId + " " + duration + " " + compactJsonLine(entry);
+    const parts = [operation, tool, shortName, language, itemId, duration, toolCallResult];
+    if (logicResult) {
+      parts.push(logicResult);
+    }
+    return parts;
+  }
+
+  function formatLogLine(entry) {
+    const parts = buildLogParts(entry);
+    return parts.join(" ");
   }
 
   function buildInterceptModeRow(session) {
@@ -467,49 +638,378 @@
     return row;
   }
 
-  function buildLogPanel(_session, logs) {
+  function buildLogPanel(sessionId, logs) {
     const panel = document.createElement("div");
     panel.className = "log-panel";
+    const control = getPausedLogState(sessionId);
+    const header = document.createElement("div");
+    header.className = "log-controls";
+    const pauseBtn = document.createElement("button");
+    pauseBtn.type = "button";
+    pauseBtn.textContent = control.paused ? "Resume" : "Pause";
+    pauseBtn.addEventListener("click", function () {
+      togglePauseLogs(sessionId);
+    });
+    header.appendChild(pauseBtn);
+    panel.appendChild(header);
     const lines = document.createElement("div");
     lines.className = "log-lines";
     panel.appendChild(lines);
     if (!Array.isArray(logs) || logs.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "log-line mono";
+      empty.textContent = "[no logs]";
+      lines.appendChild(empty);
       return panel;
     }
-    const selected = logs.slice(-LOG_ENTRY_WINDOW_SIZE);
+    const selected = trimLogEntries(logs);
     selected.forEach((entry) => {
       if (!entry || typeof entry !== "object") {
         return;
       }
-      const callLine = document.createElement("div");
-      callLine.className = "log-line mono";
-      callLine.textContent = formatCallLogLine(entry);
-      lines.appendChild(callLine);
-      const replyLine = document.createElement("div");
-      replyLine.className = "log-line mono";
-      replyLine.textContent = formatReplyLogLine(entry);
-      lines.appendChild(replyLine);
+      const wrapper = document.createElement("div");
+      wrapper.className = "log-entry";
+
+      const line = document.createElement("div");
+      line.className = "log-line mono log-line-clickable";
+      const parts = buildLogParts(entry);
+      parts.forEach(function (part, index) {
+        if (index > 0) {
+          line.appendChild(document.createTextNode(" "));
+        }
+        if (index === 4) {
+          appendDisplayIdentifier(line, part);
+        } else {
+          line.appendChild(document.createTextNode(part));
+        }
+      });
+      wrapper.appendChild(line);
+
+      const details = document.createElement("pre");
+      details.className = "log-details mono";
+      details.hidden = true;
+      details.textContent = JSON.stringify(entry, null, 2);
+      details.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+      });
+      wrapper.appendChild(details);
+
+      line.addEventListener("click", function () {
+        details.hidden = !details.hidden;
+        line.classList.toggle("open", !details.hidden);
+      });
+
+      lines.appendChild(wrapper);
     });
     return panel;
   }
 
-  function formatOutgoingRelation(value) {
-    if (typeof value === "string" && value) {
-      return value;
+  function itemTypeLabel(typeValue) {
+    if (typeof typeValue !== "string" || !typeValue) {
+      return "unknown";
     }
-    if (!value || typeof value !== "object") {
+    const normalized = typeValue.replace("-", "_");
+    if (normalized === "rule") {
+      return "rule";
+    }
+    if (normalized === "bundle") {
+      return "bundle";
+    }
+    if (normalized === "expectation") {
+      return "expectation";
+    }
+    if (normalized === "concept") {
+      return "concept";
+    }
+    if (normalized === "code_binding") {
+      return "code binding";
+    }
+    return normalized;
+  }
+
+  function contentLanguageName(contentLang, rowType) {
+    if (contentLang === "pyexpr") {
+      return "pyexpr";
+    }
+    if (contentLang === "smt2") {
+      return "smt2";
+    }
+    if (contentLang === "expect") {
+      return "expect";
+    }
+    if (contentLang === "meaning") {
+      return "meaning";
+    }
+    if (contentLang === "source_code") {
+      return "source code";
+    }
+    if (rowType === "concept") {
+      return "meaning";
+    }
+    if (rowType === "code_binding") {
+      return "source code";
+    }
+    return "unknown";
+  }
+
+  function contentLanguageIcon(contentLang, rowType, hasId) {
+    if (contentLang === "pyexpr") {
+      return ICONS.language.pyexpr;
+    }
+    if (contentLang === "smt2") {
+      return ICONS.language.smt2;
+    }
+    if (contentLang === "expect") {
+      return ICONS.language.expect;
+    }
+    if (contentLang === "meaning" || rowType === "concept") {
+      return ICONS.language.meaning;
+    }
+    if (contentLang === "source_code" || rowType === "code_binding") {
+      return "📄";
+    }
+    if (contentLang) {
+      return hasId ? ICONS.language.unknownWithId : ICONS.language.none;
+    }
+    if (hasId) {
+      return ICONS.language.idOnly;
+    }
+    return ICONS.language.none;
+  }
+
+  function formatBytes(value) {
+    const bytes = Number(value);
+    if (!Number.isFinite(bytes) || bytes < 0) {
       return "";
     }
-    const label = typeof value.label === "string" && value.label ? value.label : "related";
-    const targetId = typeof value.target_id === "string" && value.target_id ? value.target_id : "?";
-    return label + " -> " + targetId;
+    const whole = Math.floor(bytes);
+    if (whole < 1024) {
+      return whole + " B";
+    }
+    const kib = whole / 1024;
+    if (kib < 10) {
+      return kib.toFixed(1) + " KiB";
+    }
+    return Math.round(kib) + " KiB";
+  }
+
+  function isoFromEpoch(epochValue) {
+    const epoch = Number(epochValue);
+    if (!Number.isFinite(epoch) || epoch <= 0) {
+      return "";
+    }
+    return new Date(epoch * 1000).toISOString();
+  }
+
+  function ageFromEpoch(epochValue) {
+    const epoch = Number(epochValue);
+    if (!Number.isFinite(epoch) || epoch <= 0) {
+      return "";
+    }
+    const seconds = Math.max(0, Math.floor(Date.now() / 1000 - epoch));
+    if (seconds < 60) {
+      return seconds + "s ago";
+    }
+    if (seconds < 3600) {
+      return Math.floor(seconds / 60) + "m ago";
+    }
+    if (seconds < 86400) {
+      return Math.floor(seconds / 3600) + "h ago";
+    }
+    return Math.floor(seconds / 86400) + "d ago";
+  }
+
+  function identifierTitle(row) {
+    const version = Number(row && row.version);
+    const versionText = Number.isFinite(version) && version >= 1 ? String(Math.floor(version)) : "unknown";
+    const createdEpoch = Number(row && row.created_at);
+    let createdText = "unknown";
+    if (Number.isFinite(createdEpoch) && createdEpoch > 0) {
+      const ageSeconds = Math.max(0, Math.floor(Date.now() / 1000 - createdEpoch));
+      createdText = ageSeconds < 86400 ? ageFromEpoch(createdEpoch) : isoFromEpoch(createdEpoch);
+    }
+    return "version: " + versionText + "\ncreated: " + createdText;
+  }
+
+  function prettyContentValue(value) {
+    if (value === null || value === undefined) {
+      return "[no content]";
+    }
+    if (typeof value === "string") {
+      return value;
+    }
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch (_) {
+      return String(value);
+    }
+  }
+
+  function appendDisplayIdentifier(target, text) {
+    const value = typeof text === "string" ? text : "";
+    if (!value) {
+      return;
+    }
+    if (value === "no-air-control") {
+      const em = document.createElement("em");
+      em.textContent = value;
+      target.appendChild(em);
+      return;
+    }
+    target.appendChild(document.createTextNode(value));
+  }
+
+  function closeContentModal() {
+    if (!state.contentModal || !state.contentModal.overlay) {
+      return;
+    }
+    state.contentModal.overlay.hidden = true;
+  }
+
+  function ensureContentModal() {
+    if (state.contentModal && state.contentModal.overlay) {
+      return state.contentModal;
+    }
+    const overlay = document.createElement("div");
+    overlay.className = "content-modal-overlay";
+    overlay.hidden = true;
+
+    const modal = document.createElement("div");
+    modal.className = "content-modal";
+
+    const header = document.createElement("div");
+    header.className = "content-modal-head";
+
+    const title = document.createElement("strong");
+    title.textContent = "Content";
+    header.appendChild(title);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.textContent = "Close";
+    closeBtn.addEventListener("click", function () {
+      closeContentModal();
+    });
+    header.appendChild(closeBtn);
+
+    const meta = document.createElement("pre");
+    meta.className = "content-modal-meta mono";
+    const value = document.createElement("pre");
+    value.className = "content-modal-value mono";
+
+    modal.appendChild(header);
+    modal.appendChild(meta);
+    modal.appendChild(value);
+    overlay.appendChild(modal);
+
+    overlay.addEventListener("click", function (ev) {
+      if (ev.target === overlay) {
+        closeContentModal();
+      }
+    });
+
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") {
+        closeContentModal();
+      }
+    });
+
+    document.body.appendChild(overlay);
+    state.contentModal = { overlay: overlay, title: title, meta: meta, value: value };
+    return state.contentModal;
+  }
+
+  function relationReferenceList(relations, idKey) {
+    const out = [];
+    const items = Array.isArray(relations) ? relations : [];
+    items.forEach(function (relation) {
+      if (!relation || typeof relation !== "object") {
+        return;
+      }
+      const relatedId = typeof relation[idKey] === "string" ? relation[idKey] : "";
+      if (!relatedId) {
+        return;
+      }
+      const label = typeof relation.label === "string" ? relation.label : "";
+      out.push(label ? (label + ":" + relatedId) : relatedId);
+    });
+    return out;
+  }
+
+  function openContentModal(row, context) {
+    const modal = ensureContentModal();
+    const targetRow = (row && typeof row === "object") ? row : {};
+    const ctx = (context && typeof context === "object") ? context : {};
+    const originRow = (ctx.originRow && typeof ctx.originRow === "object") ? ctx.originRow : targetRow;
+    const relationLabel = typeof ctx.relationLabel === "string" ? ctx.relationLabel : "";
+    const itemType = typeof targetRow.type === "string" ? targetRow.type : "";
+    const itemId = typeof targetRow.id === "string" ? targetRow.id : "_none_";
+    const hasId = itemId !== "_none_";
+    const langName = contentLanguageName(targetRow.content_lang, itemType);
+    const langIcon = contentLanguageIcon(targetRow.content_lang, itemType, hasId);
+    const bytesText = formatBytes(targetRow.content_bytes);
+    const version = Number(targetRow.version);
+    const versionText = Number.isFinite(version) && version >= 1 ? String(Math.floor(version)) : "unknown";
+    const createdIso = isoFromEpoch(targetRow.created_at) || "unknown";
+    const ageText = ageFromEpoch(targetRow.created_at);
+    const createdText = ageText ? createdIso + " (" + ageText + ")" : createdIso;
+    const originId = typeof originRow.id === "string" ? originRow.id : "_none_";
+    const originType = itemTypeLabel(typeof originRow.type === "string" ? originRow.type : "");
+    const originSuffix = relationLabel ? (", via " + relationLabel) : "";
+    const outgoingRefs = relationReferenceList(targetRow.outgoing_relations, "target_id");
+    const incomingRefs = relationReferenceList(targetRow.incoming_relations, "source_id");
+
+    modal.title.textContent = langIcon + " " + langName;
+    modal.meta.textContent = [
+      "identifier: " + itemId,
+      "type: " + itemTypeLabel(itemType),
+      "origin: " + originId + " (" + originType + originSuffix + ")",
+      "references_outgoing: " + (outgoingRefs.length ? outgoingRefs.join(", ") : "[none]"),
+      "references_incoming: " + (incomingRefs.length ? incomingRefs.join(", ") : "[none]"),
+      "version: " + versionText,
+      "date: " + createdText,
+      "bytes: " + (bytesText || "unknown")
+    ].join("\n");
+    modal.value.textContent = prettyContentValue(targetRow.content_value);
+    modal.overlay.hidden = false;
+  }
+
+  function appendRelationLines(cell, relations, idKey, idToType, idToRow, originRow) {
+    const items = Array.isArray(relations) ? relations : [];
+    items.forEach(function (relation) {
+      if (!relation || typeof relation !== "object") {
+        return;
+      }
+      const relatedId = typeof relation[idKey] === "string" ? relation[idKey] : "";
+      if (!relatedId) {
+        return;
+      }
+      const relatedType = typeof idToType[relatedId] === "string" ? idToType[relatedId] : "";
+      const relatedRow = idToRow && typeof idToRow[relatedId] === "object" ? idToRow[relatedId] : null;
+      const relationLabel = typeof relation.label === "string" ? relation.label : "";
+      const line = document.createElement("button");
+      line.type = "button";
+      line.className = "graph-relation-line relation-open mono";
+      const icon = document.createElement("span");
+      icon.textContent = iconForItemType(relatedType);
+      icon.title = itemTypeLabel(relatedType);
+      line.appendChild(icon);
+      line.appendChild(document.createTextNode(" "));
+      appendDisplayIdentifier(line, relatedId);
+      if (relatedRow) {
+        line.addEventListener("click", function () {
+          openContentModal(relatedRow, { originRow: originRow, relationLabel: relationLabel });
+        });
+      } else {
+        line.disabled = true;
+      }
+      cell.appendChild(line);
+    });
   }
 
   function buildGraphElement(sessionId) {
-    const tablePayload = state.graphsBySession[sessionId];
-    if (!tablePayload || typeof tablePayload !== "object") {
-      return null;
-    }
+    const rawTablePayload = state.graphsBySession[sessionId];
+    const tablePayload = (rawTablePayload && typeof rawTablePayload === "object") ? rawTablePayload : { rows: [] };
     const rows = Array.isArray(tablePayload.rows) ? tablePayload.rows : [];
     const wrap = document.createElement("div");
     wrap.className = "graph-table-wrap";
@@ -518,7 +1018,7 @@
 
     const thead = document.createElement("thead");
     const headerRow = document.createElement("tr");
-    ["Type", "Identifier", "Outgoing Relations", "Incoming"].forEach((label) => {
+    ["Identifier", "Content", "Outgoing", "Incoming"].forEach((label) => {
       const th = document.createElement("th");
       th.textContent = label;
       headerRow.appendChild(th);
@@ -536,6 +1036,14 @@
       tr.appendChild(td);
       tbody.appendChild(tr);
     } else {
+      const idToType = {};
+      const idToRow = {};
+      rows.forEach(function (row) {
+        if (row && typeof row === "object" && typeof row.id === "string" && row.id) {
+          idToType[row.id] = typeof row.type === "string" ? row.type : "";
+          idToRow[row.id] = row;
+        }
+      });
       rows.forEach((row) => {
         if (!row || typeof row !== "object") {
           return;
@@ -543,29 +1051,42 @@
         const tr = document.createElement("tr");
         const itemType = typeof row.type === "string" ? row.type : "";
         const itemId = typeof row.id === "string" ? row.id : "";
-        const incomingRaw = Number(row.incoming_relations_count);
-        const incoming = Number.isFinite(incomingRaw) ? Math.max(0, Math.floor(incomingRaw)) : 0;
-
-        const typeCell = document.createElement("td");
-        typeCell.className = "graph-type-cell";
-        typeCell.textContent = iconForItemType(itemType) + " " + (itemType || "unknown");
-        tr.appendChild(typeCell);
 
         const idCell = document.createElement("td");
         idCell.className = "graph-id-cell mono";
-        idCell.textContent = itemId || "_none_";
+        const typeIcon = document.createElement("span");
+        typeIcon.textContent = iconForItemType(itemType);
+        typeIcon.title = itemTypeLabel(itemType);
+        idCell.appendChild(typeIcon);
+        idCell.appendChild(document.createTextNode(" "));
+        appendDisplayIdentifier(idCell, itemId || "_none_");
+        idCell.title = identifierTitle(row);
         tr.appendChild(idCell);
+
+        const contentCell = document.createElement("td");
+        contentCell.className = "graph-content-cell mono";
+        const hasId = itemId !== "_none_" && !!itemId;
+        const contentIcon = contentLanguageIcon(row.content_lang, itemType, hasId);
+        const contentName = contentLanguageName(row.content_lang, itemType);
+        const contentBytes = formatBytes(row.content_bytes);
+        const contentBtn = document.createElement("button");
+        contentBtn.className = "content-open";
+        contentBtn.title = contentName;
+        contentBtn.textContent = contentIcon + (contentBytes ? " " + contentBytes : "");
+        contentBtn.addEventListener("click", function () {
+          openContentModal(row, { originRow: row });
+        });
+        contentCell.appendChild(contentBtn);
+        tr.appendChild(contentCell);
 
         const outgoingCell = document.createElement("td");
         outgoingCell.className = "graph-outgoing-cell mono";
-        const rawOutgoing = Array.isArray(row.outgoing_relations) ? row.outgoing_relations : [];
-        const textOutgoing = rawOutgoing.map(formatOutgoingRelation).filter(Boolean);
-        outgoingCell.textContent = textOutgoing.length ? textOutgoing.join(", ") : "_none_";
+        appendRelationLines(outgoingCell, row.outgoing_relations, "target_id", idToType, idToRow, row);
         tr.appendChild(outgoingCell);
 
         const incomingCell = document.createElement("td");
         incomingCell.className = "graph-incoming-cell mono";
-        incomingCell.textContent = String(incoming);
+        appendRelationLines(incomingCell, row.incoming_relations, "source_id", idToType, idToRow, row);
         tr.appendChild(incomingCell);
 
         tbody.appendChild(tr);
@@ -656,7 +1177,7 @@
     return box;
   }
 
-  function buildMessageComposeCard(session) {
+  function buildMessageComposeCard(sessionId) {
     const card = document.createElement("div");
     card.className = "intercept-block";
     const details = document.createElement("details");
@@ -736,14 +1257,13 @@
     const sendButton = document.createElement("button");
     sendButton.className = "primary";
     sendButton.textContent = "Send to Agent";
-    const isOnline = !!session.can_send_message;
-    sendButton.disabled = !isOnline;
+    sendButton.disabled = true;
     row.appendChild(sendButton);
     content.appendChild(row);
 
     const status = document.createElement("div");
     status.className = "hint small";
-    status.textContent = isOnline ? "Agent stream is online." : "Agent stream is offline. You can compose, but send is disabled.";
+    status.textContent = "Agent stream is offline. You can compose, but send is disabled.";
     content.appendChild(status);
 
     sendButton.addEventListener("click", function () {
@@ -752,7 +1272,7 @@
         .split(",")
         .map(function (item) { return item.trim(); })
         .filter(Boolean);
-      submitSessionMessage(session.session_id, {
+      submitSessionMessage(sessionId, {
         message: message.value,
         level: level.value,
         title: title.value,
@@ -772,84 +1292,501 @@
 
     details.appendChild(content);
     card.appendChild(details);
-    return card;
+    return {
+      card: card,
+      setOnline: function (isOnline) {
+        const online = !!isOnline;
+        sendButton.disabled = !online;
+        if (online) {
+          if (status.textContent === "Agent stream is offline. You can compose, but send is disabled.") {
+            status.textContent = "Agent stream is online.";
+          }
+        } else {
+          status.textContent = "Agent stream is offline. You can compose, but send is disabled.";
+        }
+      }
+    };
+  }
+
+  function sidecarStateIcon(sidecar) {
+    const value = sidecar && typeof sidecar.state === "string" ? sidecar.state : "Disconnected";
+    if (value === "Idle") {
+      return ICONS.software.idle;
+    }
+    if (value === "Tentative") {
+      return ICONS.software.tentative;
+    }
+    if (value === "Attached") {
+      return ICONS.software.attached;
+    }
+    return ICONS.software.disconnected;
+  }
+
+  function sidecarStateLabel(sidecar) {
+    return sidecar && typeof sidecar.state === "string" ? sidecar.state : "Disconnected";
+  }
+
+  function stringifyResult(result) {
+    try {
+      return JSON.stringify(result, null, 2);
+    } catch (_) {
+      return String(result);
+    }
+  }
+
+  function setSidecarOutput(instanceId, textValue) {
+    if (!instanceId || typeof instanceId !== "string") {
+      return;
+    }
+    state.sidecarOutputByInstance[instanceId] = String(textValue || "");
+  }
+
+  function ensureSidecarsRoot() {
+    if (!sidecarsEl) {
+      return null;
+    }
+    if (view.sidecars.list && view.sidecars.empty) {
+      return view.sidecars;
+    }
+    sidecarsEl.innerHTML = "";
+
+    const heading = document.createElement("h2");
+    heading.textContent = "LogiCars";
+    sidecarsEl.appendChild(heading);
+
+    const hint = document.createElement("p");
+    hint.className = "hint";
+    hint.textContent = "Connected sidecars are shown before sessions. Disconnected sidecars are retained for up to one hour.";
+    sidecarsEl.appendChild(hint);
+
+    const empty = document.createElement("div");
+    empty.className = "hint";
+    empty.textContent = "No LogiCars connected.";
+    sidecarsEl.appendChild(empty);
+
+    const list = document.createElement("div");
+    sidecarsEl.appendChild(list);
+    view.sidecars.list = list;
+    view.sidecars.empty = empty;
+    return view.sidecars;
+  }
+
+  function createSidecarCard(instanceId) {
+    const refs = {
+      instanceId: instanceId,
+      clientButtons: {}
+    };
+    const card = document.createElement("article");
+    card.className = "sidecar-card";
+
+    const head = document.createElement("div");
+    head.className = "sidecar-head";
+    const title = document.createElement("div");
+    title.className = "sidecar-title";
+    const meta = document.createElement("div");
+    meta.className = "sidecar-meta mono";
+    head.appendChild(title);
+    head.appendChild(meta);
+    card.appendChild(head);
+
+    const details = document.createElement("div");
+    details.className = "sidecar-details mono";
+    card.appendChild(details);
+
+    const controls = document.createElement("div");
+    controls.className = "sidecar-controls";
+
+    const sessionRow = document.createElement("div");
+    sessionRow.className = "sidecar-row";
+    const sessionInput = document.createElement("input");
+    sessionInput.type = "text";
+    sessionInput.placeholder = "session id";
+    const sessionBtn = document.createElement("button");
+    sessionBtn.textContent = "Set Session";
+    sessionBtn.addEventListener("click", function () {
+      const value = sessionInput.value || "";
+      submitSidecarCommand(refs.instanceId, "set_session", { session: value }).then(function (result) {
+        setSidecarOutput(refs.instanceId, stringifyResult(result.result || result));
+        renderSidecarsFromState();
+      }).catch(function (err) {
+        setSidecarOutput(refs.instanceId, "set_session failed: " + err.message);
+        renderSidecarsFromState();
+      });
+    });
+    sessionRow.appendChild(sessionInput);
+    sessionRow.appendChild(sessionBtn);
+    controls.appendChild(sessionRow);
+
+    ["codex", "claude"].forEach(function (clientName) {
+      const row = document.createElement("div");
+      row.className = "sidecar-row";
+      const label = document.createElement("strong");
+      label.textContent = clientName;
+      row.appendChild(label);
+
+      const addButton = document.createElement("button");
+      addButton.textContent = "Add";
+      addButton.addEventListener("click", function () {
+        submitSidecarCommand(refs.instanceId, "add_tool", { client: clientName }).then(function (result) {
+          setSidecarOutput(refs.instanceId, stringifyResult(result.result || result));
+          renderSidecarsFromState();
+        }).catch(function (err) {
+          setSidecarOutput(refs.instanceId, "add_tool failed: " + err.message);
+          renderSidecarsFromState();
+        });
+      });
+
+      const listButton = document.createElement("button");
+      listButton.textContent = "List";
+      listButton.addEventListener("click", function () {
+        submitSidecarCommand(refs.instanceId, "list_tools", { client: clientName }).then(function (result) {
+          setSidecarOutput(refs.instanceId, stringifyResult(result.result || result));
+          renderSidecarsFromState();
+        }).catch(function (err) {
+          setSidecarOutput(refs.instanceId, "list_tools failed: " + err.message);
+          renderSidecarsFromState();
+        });
+      });
+
+      const removeButton = document.createElement("button");
+      removeButton.textContent = "Remove";
+      removeButton.addEventListener("click", function () {
+        submitSidecarCommand(refs.instanceId, "remove_tool", { client: clientName }).then(function (result) {
+          setSidecarOutput(refs.instanceId, stringifyResult(result.result || result));
+          renderSidecarsFromState();
+        }).catch(function (err) {
+          setSidecarOutput(refs.instanceId, "remove_tool failed: " + err.message);
+          renderSidecarsFromState();
+        });
+      });
+
+      row.appendChild(addButton);
+      row.appendChild(listButton);
+      row.appendChild(removeButton);
+      controls.appendChild(row);
+      refs.clientButtons[clientName] = {
+        addButton: addButton,
+        listButton: listButton,
+        removeButton: removeButton
+      };
+    });
+
+    const bootstrapRow = document.createElement("div");
+    bootstrapRow.className = "sidecar-row";
+    const bootstrapButton = document.createElement("button");
+    bootstrapButton.className = "primary";
+    bootstrapButton.textContent = "Write Bootstrap Files";
+    bootstrapButton.addEventListener("click", function () {
+      submitSidecarCommand(refs.instanceId, "write_bootstrap", {}).then(function (result) {
+        setSidecarOutput(refs.instanceId, stringifyResult(result.result || result));
+        renderSidecarsFromState();
+      }).catch(function (err) {
+        setSidecarOutput(refs.instanceId, "write_bootstrap failed: " + err.message);
+        renderSidecarsFromState();
+      });
+    });
+    bootstrapRow.appendChild(bootstrapButton);
+    controls.appendChild(bootstrapRow);
+
+    const output = document.createElement("pre");
+    output.className = "sidecar-output mono";
+    controls.appendChild(output);
+    card.appendChild(controls);
+
+    refs.card = card;
+    refs.title = title;
+    refs.meta = meta;
+    refs.details = details;
+    refs.sessionInput = sessionInput;
+    refs.sessionBtn = sessionBtn;
+    refs.bootstrapButton = bootstrapButton;
+    refs.output = output;
+    return refs;
+  }
+
+  function updateSidecarCard(refs, sidecar) {
+    const instanceId = typeof sidecar.instance_id === "string" ? sidecar.instance_id : refs.instanceId;
+    refs.instanceId = instanceId;
+    const local = typeof sidecar.local === "string" ? sidecar.local : "";
+    const pid = Number(sidecar.pid);
+    const pidText = Number.isFinite(pid) ? String(Math.floor(pid)) : "unknown";
+    const seen = ageFromEpoch(sidecar.last_seen_epoch) || "unknown";
+    const remote = typeof sidecar.remote === "string" ? sidecar.remote : "";
+    const workdir = typeof sidecar.workdir === "string" ? sidecar.workdir : "";
+    const sessionId = typeof sidecar.session_id === "string" ? sidecar.session_id : "";
+    const toolUrl = typeof sidecar.tool_url === "string" ? sidecar.tool_url : "";
+    const connected = !!sidecar.connected;
+
+    refs.title.textContent = ICONS.software.sidecar + " " + sidecarStateIcon(sidecar) + " " + sidecarStateLabel(sidecar);
+    refs.meta.textContent = "instance=" + instanceId + " pid=" + pidText + " seen=" + seen + " remote=" + remote + " local=" + local;
+    refs.details.textContent = "workdir=" + workdir + "\nsession=" + (sessionId || "[none]") + "\ntool_url=" + (toolUrl || "[none]");
+    if (document.activeElement !== refs.sessionInput) {
+      refs.sessionInput.value = sessionId;
+    }
+    refs.sessionBtn.disabled = !connected;
+    Object.keys(refs.clientButtons).forEach(function (clientName) {
+      const rowButtons = refs.clientButtons[clientName];
+      rowButtons.addButton.disabled = !connected;
+      rowButtons.listButton.disabled = !connected;
+      rowButtons.removeButton.disabled = !connected;
+    });
+    refs.bootstrapButton.disabled = !connected;
+    refs.output.textContent = state.sidecarOutputByInstance[instanceId] || "";
+  }
+
+  function renderSidecarsFromState() {
+    const root = ensureSidecarsRoot();
+    if (!root || !root.list || !root.empty) {
+      return;
+    }
+    const sidecars = Array.isArray(state.sidecars) ? state.sidecars : [];
+    const nextIds = {};
+    sidecars.forEach(function (sidecar) {
+      if (!sidecar || typeof sidecar !== "object") {
+        return;
+      }
+      const instanceId = typeof sidecar.instance_id === "string" ? sidecar.instance_id : "";
+      if (!instanceId) {
+        return;
+      }
+      nextIds[instanceId] = true;
+      let refs = view.sidecars.cardsById[instanceId];
+      if (!refs) {
+        refs = createSidecarCard(instanceId);
+        view.sidecars.cardsById[instanceId] = refs;
+      }
+      updateSidecarCard(refs, sidecar);
+      root.list.appendChild(refs.card);
+    });
+    Object.keys(view.sidecars.cardsById).forEach(function (instanceId) {
+      if (!nextIds[instanceId]) {
+        const refs = view.sidecars.cardsById[instanceId];
+        if (refs && refs.card && refs.card.parentNode) {
+          refs.card.parentNode.removeChild(refs.card);
+        }
+        delete view.sidecars.cardsById[instanceId];
+      }
+    });
+    root.empty.hidden = Object.keys(nextIds).length > 0;
+  }
+
+  function ensureSessionsRoot() {
+    if (!sessionsEl) {
+      return null;
+    }
+    if (view.sessions.list && view.sessions.empty) {
+      return view.sessions;
+    }
+    sessionsEl.innerHTML = "";
+    const empty = document.createElement("div");
+    empty.textContent = "No sessions available.";
+    sessionsEl.appendChild(empty);
+    const list = document.createElement("div");
+    sessionsEl.appendChild(list);
+    view.sessions.list = list;
+    view.sessions.empty = empty;
+    return view.sessions;
+  }
+
+  function createSessionCard(sessionId) {
+    const refs = { sessionId: sessionId };
+    const card = document.createElement("article");
+    card.className = "session-card";
+
+    const headline = document.createElement("div");
+    headline.className = "session-headline";
+    headline.tabIndex = 0;
+    headline.setAttribute("role", "button");
+    headline.addEventListener("click", function () {
+      toggleSessionExpanded(sessionId);
+    });
+    headline.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        toggleSessionExpanded(sessionId);
+      }
+    });
+    const left = document.createElement("div");
+    left.className = "session-name";
+    const right = document.createElement("div");
+    right.className = "session-meta";
+    const connected = document.createElement("span");
+    const cps = document.createElement("span");
+    const ago = document.createElement("span");
+    right.appendChild(connected);
+    right.appendChild(cps);
+    right.appendChild(ago);
+    headline.appendChild(left);
+    headline.appendChild(right);
+    card.appendChild(headline);
+
+    const body = document.createElement("div");
+    body.className = "session-body";
+    const actions = document.createElement("div");
+    actions.className = "session-actions";
+    body.appendChild(actions);
+
+    const modeHost = document.createElement("div");
+    body.appendChild(modeHost);
+    const divider = document.createElement("hr");
+    divider.className = "divider";
+    body.appendChild(divider);
+
+    const graphHost = document.createElement("div");
+    body.appendChild(graphHost);
+
+    const compose = buildMessageComposeCard(sessionId);
+    body.appendChild(compose.card);
+
+    const logHost = document.createElement("div");
+    body.appendChild(logHost);
+
+    const pendingHost = document.createElement("div");
+    body.appendChild(pendingHost);
+
+    card.appendChild(body);
+
+    refs.card = card;
+    refs.headline = headline;
+    refs.left = left;
+    refs.connected = connected;
+    refs.cps = cps;
+    refs.ago = ago;
+    refs.body = body;
+    refs.actions = actions;
+    refs.modeHost = modeHost;
+    refs.graphHost = graphHost;
+    refs.compose = compose;
+    refs.logHost = logHost;
+    refs.pendingHost = pendingHost;
+    return refs;
+  }
+
+  function updateSessionCard(refs, session) {
+    const sessionId = session.session_id;
+    const logs = visibleLogsForSession(sessionId);
+    const expanded = isSessionExpanded(sessionId);
+    refs.headline.setAttribute("aria-expanded", expanded ? "true" : "false");
+    refs.left.textContent = (expanded ? "▾ " : "▸ ") + sessionId;
+    const count = Number.isFinite(session.connected_clients) ? session.connected_clients : 0;
+    refs.connected.textContent = count + (count === 1 ? " client" : " clients");
+    refs.cps.textContent = fmtCallsPerSecond(session.calls_per_second, session.last_activity_seconds_ago);
+    refs.ago.textContent = fmtAgo(session.last_activity_iso, session.last_activity_seconds_ago);
+    refs.body.className = expanded ? "session-body open" : "session-body";
+    refs.body.hidden = !expanded;
+
+    refs.actions.innerHTML = "";
+    if (canShowRemoveSession(session)) {
+      const resetButton = document.createElement("button");
+      resetButton.className = "warning";
+      resetButton.textContent = "Reset session";
+      resetButton.addEventListener("click", function () {
+        const confirmation = window.confirm(
+          "Reset session '" + session.session_id + "'? This clears rules/bundles/expectations/context and can also clear logs."
+        );
+        if (!confirmation) {
+          return;
+        }
+        resetButton.disabled = true;
+        resetSessionData(session.session_id, true).then(function () {
+          state.graphsBySession[session.session_id] = {
+            session_id: session.session_id,
+            row_count: 0,
+            rows: []
+          };
+          state.logsBySession[session.session_id] = [];
+          const control = getPausedLogState(session.session_id);
+          control.buffer = [];
+          renderSessionsFromState();
+        }).catch(function (err) {
+          resetButton.disabled = false;
+          window.alert("Reset failed: " + err.message);
+        });
+      });
+      refs.actions.appendChild(resetButton);
+
+      const removeButton = document.createElement("button");
+      removeButton.className = "danger";
+      removeButton.textContent = "Remove session";
+      removeButton.addEventListener("click", function () {
+        const confirmation = window.confirm(
+          "Remove session '" + session.session_id + "'? This deletes its entire store directory and logs."
+        );
+        if (!confirmation) {
+          return;
+        }
+        removeButton.disabled = true;
+        removeSessionData(session.session_id).then(function () {
+          removeSessionFromState(session.session_id);
+          renderSessionsFromState();
+        }).catch(function (err) {
+          removeButton.disabled = false;
+          window.alert("Remove failed: " + err.message);
+        });
+      });
+      refs.actions.appendChild(removeButton);
+    }
+
+    refs.modeHost.innerHTML = "";
+    refs.modeHost.appendChild(buildInterceptModeRow(session));
+
+    refs.graphHost.innerHTML = "";
+    const graphEl = buildGraphElement(sessionId);
+    if (graphEl) {
+      refs.graphHost.appendChild(graphEl);
+    }
+
+    refs.compose.setOnline(!!session.can_send_message);
+
+    refs.logHost.innerHTML = "";
+    refs.logHost.appendChild(buildLogPanel(sessionId, logs));
+
+    refs.pendingHost.innerHTML = "";
+    const pending = Array.isArray(session.pending_intercepts) ? session.pending_intercepts : [];
+    pending.forEach(function (item) {
+      if (item.stage === "call") {
+        refs.pendingHost.appendChild(buildCallInterceptBlock(item));
+      } else if (item.stage === "reply") {
+        refs.pendingHost.appendChild(buildReplyInterceptBlock(item));
+      }
+    });
   }
 
   function renderSessionsFromState() {
-    const sessions = Array.isArray(state.sessions) ? state.sessions : [];
-    sessionsEl.innerHTML = "";
-    if (sessions.length === 0) {
-      sessionsEl.textContent = "No sessions available.";
+    const root = ensureSessionsRoot();
+    if (!root || !root.list || !root.empty) {
       return;
     }
-    for (let i = 0; i < sessions.length; i += 1) {
-      const session = sessions[i];
-      const logs = state.logsBySession[session.session_id] || [];
-      const card = document.createElement("article");
-      card.className = "session-card";
-
-      const headline = document.createElement("button");
-      headline.className = "session-headline";
-      const left = document.createElement("div");
-      left.className = "session-name";
-      left.textContent = session.session_id;
-      const right = document.createElement("div");
-      right.className = "session-meta";
-      const connected = document.createElement("span");
-      const count = Number.isFinite(session.connected_clients) ? session.connected_clients : 0;
-      connected.textContent = count + (count === 1 ? " client" : " clients");
-      const cps = document.createElement("span");
-      cps.textContent = fmtCallsPerSecond(session.calls_per_second, session.last_activity_seconds_ago);
-      const ago = document.createElement("span");
-      ago.textContent = fmtAgo(session.last_activity_iso, session.last_activity_seconds_ago);
-      right.appendChild(connected);
-      right.appendChild(cps);
-      right.appendChild(ago);
-      headline.appendChild(left);
-      headline.appendChild(right);
-      card.appendChild(headline);
-
-      const body = document.createElement("div");
-      body.className = "session-body";
-      if (expanded.has(session.session_id)) {
-        body.classList.add("open");
+    const sessions = Array.isArray(state.sessions) ? state.sessions : [];
+    const nextIds = {};
+    sessions.forEach(function (session) {
+      if (!session || typeof session !== "object" || typeof session.session_id !== "string" || !session.session_id) {
+        return;
       }
-      headline.addEventListener("click", function () {
-        if (expanded.has(session.session_id)) {
-          expanded.delete(session.session_id);
-          body.classList.remove("open");
-        } else {
-          expanded.add(session.session_id);
-          body.classList.add("open");
-        }
-      });
-
-      body.appendChild(buildInterceptModeRow(session));
-      const divider = document.createElement("hr");
-      divider.className = "divider";
-      body.appendChild(divider);
-      const graphEl = buildGraphElement(session.session_id);
-      if (graphEl) {
-        body.appendChild(graphEl);
+      const sessionId = session.session_id;
+      nextIds[sessionId] = true;
+      let refs = view.sessions.cardsById[sessionId];
+      if (!refs) {
+        refs = createSessionCard(sessionId);
+        view.sessions.cardsById[sessionId] = refs;
       }
-      body.appendChild(buildMessageComposeCard(session));
-      body.appendChild(buildLogPanel(session, logs));
-
-      const pending = Array.isArray(session.pending_intercepts) ? session.pending_intercepts : [];
-      pending.forEach((item) => {
-        if (item.stage === "call") {
-          body.appendChild(buildCallInterceptBlock(item));
-        } else if (item.stage === "reply") {
-          body.appendChild(buildReplyInterceptBlock(item));
+      updateSessionCard(refs, session);
+      root.list.appendChild(refs.card);
+    });
+    Object.keys(view.sessions.cardsById).forEach(function (sessionId) {
+      if (!nextIds[sessionId]) {
+        const refs = view.sessions.cardsById[sessionId];
+        if (refs && refs.card && refs.card.parentNode) {
+          refs.card.parentNode.removeChild(refs.card);
         }
-      });
-
-      card.appendChild(body);
-      sessionsEl.appendChild(card);
-    }
+        delete view.sessions.cardsById[sessionId];
+      }
+    });
+    root.empty.hidden = Object.keys(nextIds).length > 0;
   }
 
   function applySnapshot(payload) {
+    const sidecars = payload && Array.isArray(payload.sidecars) ? payload.sidecars : [];
     const sessions = payload && Array.isArray(payload.sessions) ? payload.sessions : [];
     const logsBySession = payload && payload.logs_by_session && typeof payload.logs_by_session === "object"
       ? payload.logs_by_session
@@ -857,9 +1794,42 @@
     const graphsBySession = payload && payload.graphs_by_session && typeof payload.graphs_by_session === "object"
       ? payload.graphs_by_session
       : {};
+    const normalizedLogs = {};
+    Object.keys(logsBySession).forEach(function (sessionId) {
+      normalizedLogs[sessionId] = trimLogEntries(logsBySession[sessionId]);
+    });
+    const sessionIds = {};
+    sessions.forEach(function (session) {
+      if (session && typeof session.session_id === "string" && session.session_id) {
+        sessionIds[session.session_id] = true;
+      }
+    });
+    Object.keys(state.pausedLogBySession).forEach(function (sessionId) {
+      if (!sessionIds[sessionId]) {
+        delete state.pausedLogBySession[sessionId];
+      }
+    });
+    Object.keys(state.expandedSessionById).forEach(function (sessionId) {
+      if (!sessionIds[sessionId]) {
+        delete state.expandedSessionById[sessionId];
+      }
+    });
+    const sidecarIds = {};
+    sidecars.forEach(function (sidecar) {
+      if (sidecar && typeof sidecar.instance_id === "string" && sidecar.instance_id) {
+        sidecarIds[sidecar.instance_id] = true;
+      }
+    });
+    Object.keys(state.sidecarOutputByInstance).forEach(function (instanceId) {
+      if (!sidecarIds[instanceId]) {
+        delete state.sidecarOutputByInstance[instanceId];
+      }
+    });
+    state.sidecars = sidecars;
     state.sessions = sessions;
-    state.logsBySession = logsBySession;
+    state.logsBySession = normalizedLogs;
     state.graphsBySession = graphsBySession;
+    renderSidecarsFromState();
     renderSessionsFromState();
   }
 
@@ -877,6 +1847,14 @@
       }
       if (payload.type === "snapshot" && payload.data) {
         applySnapshot(payload.data);
+        return;
+      }
+      if (payload.type === "event" && payload.event === "session_log" && payload.data) {
+        const data = payload.data;
+        if (typeof data.session_id === "string" && data.entry && typeof data.entry === "object") {
+          pushSessionLogEntry(data.session_id, data.entry);
+          renderSessionsFromState();
+        }
         return;
       }
       if (payload.type === "event" && payload.event === "session_graph_updated" && payload.data) {

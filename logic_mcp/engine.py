@@ -38,6 +38,11 @@ MAX_SYMBOLS = 2000
 TYPE_INT = "Int"
 TYPE_REAL = "Real"
 TYPE_BOOL = "Bool"
+MODEL_SCOPE_NONE = "none"
+MODEL_SCOPE_FACTS = "facts"
+MODEL_SCOPE_ALL = "all"
+MODEL_SCOPE_SELECTED = "selected"
+MODEL_SCOPE_VALUES = [MODEL_SCOPE_NONE, MODEL_SCOPE_FACTS, MODEL_SCOPE_ALL, MODEL_SCOPE_SELECTED]
 SMT2_ALLOWED_COMMANDS = {
     "assert",
     "declare-const",
@@ -45,6 +50,8 @@ SMT2_ALLOWED_COMMANDS = {
     "define-fun",
     "define-fun-rec",
     "define-funs-rec",
+    "set-logic",
+    "set-option",
 }
 
 
@@ -128,6 +135,8 @@ class PyExprCompiler:
                     return TYPE_REAL
                 if all(t == TYPE_INT for t in arg_types if t is not None) and arg_types:
                     return TYPE_INT
+            if node.func.id in {"implies", "xor"}:
+                return TYPE_BOOL
         if isinstance(node, ast.IfExp):
             t_body = self._guess_type(node.body)
             t_else = self._guess_type(node.orelse)
@@ -160,8 +169,11 @@ class PyExprCompiler:
         if isinstance(node, ast.Call):
             if not isinstance(node.func, ast.Name):
                 raise LogicError("E_UNSUPPORTED", "Only simple function calls are allowed")
-            if node.func.id not in {"abs", "min", "max"}:
-                raise LogicError("E_UNSUPPORTED", f"Function '{node.func.id}' is not allowed")
+            if node.func.id not in {"abs", "min", "max", "implies", "xor"}:
+                raise LogicError(
+                    "E_UNSUPPORTED",
+                    f"Function '{node.func.id}' is not allowed; use abs|min|max|implies|xor",
+                )
             if node.keywords:
                 raise LogicError("E_UNSUPPORTED", "Keyword arguments are not allowed")
         for child in ast.iter_child_nodes(node):
@@ -280,6 +292,18 @@ class PyExprCompiler:
                 if any(t == TYPE_REAL for t in arg_types):
                     return TYPE_REAL
                 return TYPE_INT
+            if func == "implies":
+                if len(node.args) != 2:
+                    raise LogicError("E_PARSE_ERROR", "implies() takes exactly two arguments")
+                self._analyze(node.args[0], expected=TYPE_BOOL)
+                self._analyze(node.args[1], expected=TYPE_BOOL)
+                return TYPE_BOOL
+            if func == "xor":
+                if len(node.args) < 2:
+                    raise LogicError("E_PARSE_ERROR", "xor() requires at least two arguments")
+                for arg in node.args:
+                    self._analyze(arg, expected=TYPE_BOOL)
+                return TYPE_BOOL
         raise LogicError("E_UNSUPPORTED", f"Unsupported pyexpr construct: {type(node).__name__}")
 
     def infer_types(self, expr: str) -> Dict[str, str]:
@@ -472,6 +496,23 @@ class PyExprCompiler:
                             expr = z3.If(expr >= nxt_expr, expr, nxt_expr)
                         t = out_t
                     return expr, t
+                if func == "implies":
+                    if len(args) != 2:
+                        raise LogicError("E_PARSE_ERROR", "implies() takes exactly two arguments")
+                    left, left_t = args[0]
+                    right, right_t = args[1]
+                    if left_t != TYPE_BOOL or right_t != TYPE_BOOL:
+                        raise LogicError("E_PARSE_ERROR", "implies() requires boolean arguments")
+                    return z3.Implies(left, right), TYPE_BOOL
+                if func == "xor":
+                    if len(args) < 2:
+                        raise LogicError("E_PARSE_ERROR", "xor() requires at least two arguments")
+                    bool_args = []
+                    for expr, t in args:
+                        if t != TYPE_BOOL:
+                            raise LogicError("E_PARSE_ERROR", "xor() requires boolean arguments")
+                        bool_args.append(expr)
+                    return z3.Xor(*bool_args), TYPE_BOOL
             raise LogicError("E_UNSUPPORTED", "Unsupported pyexpr construct")
 
         expr, t = build(parsed.body)
@@ -777,7 +818,16 @@ class LogicEngine:
                 return entry
         raise LogicError("E_UNKNOWN_ID", f"{kind} id is already removed", {"id": item_id})
 
-    def _versioned_set(self, data: dict, kind: str, item_id: str, *, lang: str, content: Any) -> None:
+    def _versioned_set(
+        self,
+        data: dict,
+        kind: str,
+        item_id: str,
+        *,
+        lang: str,
+        content: Any,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> None:
         items = data.setdefault(kind, {})
         if not isinstance(items, dict):
             raise LogicError("E_INVALID_REQUEST", f"{kind} store is corrupted")
@@ -787,16 +837,17 @@ class LogicEngine:
         for entry in versions:
             if isinstance(entry, dict):
                 entry["enabled"] = False
-        versions.append(
-            {
-                "id": item_id,
-                "version": self._next_version(versions),
-                "enabled": True,
-                "lang": lang,
-                "content": content,
-                "created_at": time.time(),
-            }
-        )
+        entry = {
+            "id": item_id,
+            "version": self._next_version(versions),
+            "enabled": True,
+            "lang": lang,
+            "content": content,
+            "created_at": time.time(),
+        }
+        if isinstance(extra, dict):
+            entry.update(extra)
+        versions.append(entry)
 
     def _versioned_remove(self, data: dict, kind: str, item_id: str) -> None:
         items = data.get(kind, {})
@@ -824,6 +875,17 @@ class LogicEngine:
             raise LogicError("E_INVALID_REQUEST", f"{field} must not be empty")
         return out
 
+    def _reject_unknown_fields(self, args: dict, *, allowed: set[str], where: str) -> None:
+        if not isinstance(args, dict):
+            raise LogicError("E_INVALID_REQUEST", f"{where} arguments must be an object")
+        unknown = sorted(key for key in args.keys() if key not in allowed)
+        if unknown:
+            raise LogicError(
+                "E_INVALID_REQUEST",
+                f"{where} received unsupported fields",
+                {"unsupported_fields": unknown},
+            )
+
     def _normalize_rel_path(self, value: Any) -> str:
         if not isinstance(value, str) or not value.strip():
             raise LogicError("E_INVALID_REQUEST", "path must be a non-empty string")
@@ -837,37 +899,126 @@ class LogicEngine:
             raise LogicError("E_INVALID_REQUEST", "path must not contain '..'")
         if not parts:
             raise LogicError("E_INVALID_REQUEST", "path must not resolve to empty")
-        return "/".join(parts)
+        normalized = "/".join(parts)
+        if re.search(r":[0-9]+(?:[-:][0-9]+)?", normalized):
+            raise LogicError("E_INVALID_REQUEST", "path must not encode line or range information")
+        return normalized
 
-    def _normalize_anchor(self, value: Any) -> dict:
+    def _normalize_line_location(self, value: Any, field: str) -> dict:
         if not isinstance(value, dict):
-            raise LogicError("E_INVALID_REQUEST", "anchor must be an object")
-        out: dict = {}
-        if "line" in value:
-            line = value["line"]
-            if not isinstance(line, int) or line < 1:
-                raise LogicError("E_INVALID_REQUEST", "anchor.line must be an integer >= 1")
-            out["line"] = line
-        if "byte_start" in value:
-            start = value["byte_start"]
-            if not isinstance(start, int) or start < 0:
-                raise LogicError("E_INVALID_REQUEST", "anchor.byte_start must be an integer >= 0")
-            out["byte_start"] = start
-        if "byte_end" in value:
-            end = value["byte_end"]
-            if not isinstance(end, int) or end < 0:
-                raise LogicError("E_INVALID_REQUEST", "anchor.byte_end must be an integer >= 0")
-            out["byte_end"] = end
-        if "byte_start" in out and "byte_end" in out and out["byte_end"] < out["byte_start"]:
-            raise LogicError("E_INVALID_REQUEST", "anchor.byte_end must be >= anchor.byte_start")
-        if "text" in value:
-            text = value["text"]
-            if not isinstance(text, str):
-                raise LogicError("E_INVALID_REQUEST", "anchor.text must be a string")
-            if text:
-                out["text"] = text
-        if out and "line" not in out:
-            raise LogicError("E_INVALID_REQUEST", "anchor.line is required when anchor is provided")
+            raise LogicError("E_INVALID_REQUEST", f"{field} must be an object")
+        line = value.get("line")
+        if not isinstance(line, int) or line < 1:
+            raise LogicError("E_INVALID_REQUEST", f"{field}.line must be an integer >= 1")
+        out: dict[str, int] = {"line": line}
+        if "col" in value and value.get("col") is not None:
+            col = value.get("col")
+            if not isinstance(col, int) or col < 1:
+                raise LogicError("E_INVALID_REQUEST", f"{field}.col must be an integer >= 1")
+            out["col"] = col
+        return out
+
+    def _normalize_motivation(self, value: Any) -> dict:
+        if not isinstance(value, dict):
+            raise LogicError("E_INVALID_REQUEST", "motivation must be an object")
+        rationale = value.get("rationale")
+        if not isinstance(rationale, str) or not rationale.strip():
+            raise LogicError("E_INVALID_REQUEST", "motivation.rationale must be a non-empty string")
+        out: dict[str, Any] = {"rationale": rationale.strip()}
+        if "motivatedByItem" in value:
+            motivated_by = value.get("motivatedByItem")
+            if motivated_by is None:
+                out["motivatedByItem"] = None
+            elif isinstance(motivated_by, str) and motivated_by:
+                out["motivatedByItem"] = motivated_by
+            else:
+                raise LogicError("E_INVALID_REQUEST", "motivation.motivatedByItem must be a non-empty string or null")
+        return out
+
+    def _validate_motivated_by_item_exists(self, data: dict, motivation: dict, *, item_id: str) -> None:
+        motivated_by = motivation.get("motivatedByItem")
+        if motivated_by is None:
+            return
+        self._ensure_context_root(data)
+        active_ids: set[str] = set()
+        active_ids.update(self._active_items_from_data(data, "bundles").keys())
+        active_ids.update(self._active_items_from_data(data, "rules").keys())
+        active_ids.update(self._active_items_from_data(data, "expectations").keys())
+        active_ids.update(data["context"]["concepts"].keys())
+        active_ids.update(data["context"]["code_bindings"].keys())
+        if motivated_by not in active_ids:
+            raise LogicError(
+                "E_INVALID_REQUEST",
+                "motivation.motivatedByItem must reference an existing item",
+                {"id": item_id, "motivatedByItem": motivated_by},
+            )
+
+    def _binding_hash(self, binding: dict) -> str:
+        payload = {
+            "path": binding.get("path"),
+            "from": binding.get("from"),
+            "to": binding.get("to"),
+            "line_excerpt": binding.get("line_excerpt"),
+        }
+        text = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+    def _with_warnings(self, response: dict, warnings: list[dict[str, Any]]) -> dict:
+        if warnings:
+            response = dict(response)
+            response["warnings"] = warnings
+        return response
+
+    def _binding_ref_subset(self, binding_id: str, binding: dict) -> dict:
+        subset = {
+            "id": binding_id,
+            "path": binding.get("path"),
+            "from": binding.get("from"),
+            "to": binding.get("to"),
+        }
+        return self._strip_empty(subset)
+
+    def _related_binding_refs(self, item_type: str, item_id: str) -> list[dict]:
+        self._ensure_context_root(self.store.data)
+        bindings = self.store.data["context"]["code_bindings"]
+        if not isinstance(bindings, dict):
+            return []
+
+        refs: list[dict] = []
+        if item_type == "concept":
+            concept = self.store.data["context"]["concepts"].get(item_id, {})
+            if isinstance(concept, dict):
+                for binding_id in concept.get("related_code_binding_ids", []):
+                    binding = bindings.get(binding_id)
+                    if isinstance(binding_id, str) and isinstance(binding, dict):
+                        refs.append(self._binding_ref_subset(binding_id, binding))
+            return refs
+
+        relation_key = ""
+        if item_type == "rule":
+            relation_key = "related_rule_ids"
+        elif item_type == "expectation":
+            relation_key = "related_expectation_ids"
+        else:
+            return refs
+
+        for binding_id, binding in bindings.items():
+            if not isinstance(binding_id, str) or not isinstance(binding, dict):
+                continue
+            related_ids = binding.get(relation_key)
+            if isinstance(related_ids, list) and item_id in related_ids:
+                refs.append(self._binding_ref_subset(binding_id, binding))
+        refs.sort(key=lambda entry: str(entry.get("id", "")))
+        return refs
+
+    def _motivation_for_output(self, payload: dict, universe_ids: set[str]) -> dict | None:
+        motivation = payload.get("motivation")
+        if not isinstance(motivation, dict):
+            return None
+        out = dict(motivation)
+        motivated_by = out.get("motivatedByItem")
+        if isinstance(motivated_by, str) and motivated_by and motivated_by not in universe_ids:
+            out["note"] = "Item that motivated this object no longer exists."
         return out
 
     def _strip_empty(self, payload: Any) -> Any:
@@ -887,7 +1038,7 @@ class LogicEngine:
             return [self._strip_empty(item) for item in payload]
         return payload
 
-    def _binding_has_anchor_path(
+    def _binding_has_logic_path(
         self,
         binding_id: str,
         bindings: Dict[str, dict],
@@ -921,13 +1072,41 @@ class LogicEngine:
         self._ensure_context_root(data)
         self._all_id_owners(data)
 
+        active_bundles = self._active_items_from_data(data, "bundles")
         active_rules = self._active_items_from_data(data, "rules")
         active_expectations = self._active_items_from_data(data, "expectations")
         concepts = data["context"]["concepts"]
         bindings = data["context"]["code_bindings"]
 
+        # Bundles
+        for bundle_id, entry in active_bundles.items():
+            if not isinstance(entry, dict):
+                raise LogicError("E_INVALID_REQUEST", "Bundle entry must be an object", {"id": bundle_id})
+            if entry.get("id") != bundle_id:
+                raise LogicError("E_INVALID_REQUEST", "Bundle id mismatch", {"id": bundle_id})
+            if entry.get("lang") != "smt2":
+                raise LogicError("E_INVALID_REQUEST", "Bundle.lang must be smt2", {"id": bundle_id})
+            self._normalize_motivation(entry.get("motivation"))
+
+        # Rules
+        for rule_id, entry in active_rules.items():
+            if not isinstance(entry, dict):
+                raise LogicError("E_INVALID_REQUEST", "Rule entry must be an object", {"id": rule_id})
+            if entry.get("id") != rule_id:
+                raise LogicError("E_INVALID_REQUEST", "Rule id mismatch", {"id": rule_id})
+            if entry.get("lang") not in {"pyexpr", "smt2"}:
+                raise LogicError("E_INVALID_REQUEST", "Rule.lang must be pyexpr|smt2", {"id": rule_id})
+            if not isinstance(entry.get("intent"), str) or not entry.get("intent"):
+                raise LogicError("E_INVALID_REQUEST", "Rule.intent is required", {"id": rule_id})
+            self._normalize_motivation(entry.get("motivation"))
+
         # Expectation integrity: must be rule-to-rule only in v5.
         for exp_id, entry in active_expectations.items():
+            if not isinstance(entry, dict):
+                raise LogicError("E_INVALID_REQUEST", "Expectation entry must be an object", {"id": exp_id})
+            if entry.get("id") != exp_id:
+                raise LogicError("E_INVALID_REQUEST", "Expectation id mismatch", {"id": exp_id})
+            self._normalize_motivation(entry.get("motivation"))
             content = entry.get("content")
             if not isinstance(content, dict):
                 raise LogicError("E_INVALID_REQUEST", "Expectation content must be an object", {"id": exp_id})
@@ -957,6 +1136,9 @@ class LogicEngine:
             for key in ("primary_symbols", "related_rule_ids", "related_expectation_ids", "related_code_binding_ids"):
                 if not isinstance(concept.get(key), list):
                     raise LogicError("E_INVALID_REQUEST", f"Concept.{key} must be an array", {"id": concept_id})
+            if "source_ref" in concept:
+                raise LogicError("E_INVALID_REQUEST", "Concept.source_ref is no longer supported", {"id": concept_id})
+            self._normalize_motivation(concept.get("motivation"))
 
             if not (
                 concept.get("related_rule_ids")
@@ -1007,8 +1189,32 @@ class LogicEngine:
                     raise LogicError("E_INVALID_REQUEST", f"Code binding.{key} must be an array", {"id": binding_id})
             if "symbols_used" in binding and not isinstance(binding.get("symbols_used"), list):
                 raise LogicError("E_INVALID_REQUEST", "Code binding.symbols_used must be an array", {"id": binding_id})
-            if "anchor" in binding and not isinstance(binding.get("anchor"), dict):
-                raise LogicError("E_INVALID_REQUEST", "Code binding.anchor must be an object", {"id": binding_id})
+            if "function_or_behavior" in binding:
+                raise LogicError("E_INVALID_REQUEST", "Code binding.function_or_behavior is no longer supported", {"id": binding_id})
+            if "anchor" in binding:
+                raise LogicError("E_INVALID_REQUEST", "Code binding.anchor is no longer supported", {"id": binding_id})
+            self._normalize_motivation(binding.get("motivation"))
+            if "line_excerpt" in binding and binding.get("line_excerpt") is not None and not isinstance(binding.get("line_excerpt"), str):
+                raise LogicError("E_INVALID_REQUEST", "Code binding.line_excerpt must be a string", {"id": binding_id})
+            if "from" in binding and binding.get("from") is not None:
+                normalized_from = self._normalize_line_location(binding.get("from"), "from")
+                if normalized_from != binding.get("from"):
+                    raise LogicError("E_INVALID_REQUEST", "Code binding.from must be normalized", {"id": binding_id})
+            if "to" in binding and binding.get("to") is not None:
+                normalized_to = self._normalize_line_location(binding.get("to"), "to")
+                if normalized_to != binding.get("to"):
+                    raise LogicError("E_INVALID_REQUEST", "Code binding.to must be normalized", {"id": binding_id})
+            if binding.get("to") is not None and binding.get("from") is None:
+                raise LogicError("E_INVALID_REQUEST", "Code binding.to requires Code binding.from", {"id": binding_id})
+            if binding.get("from") is not None and binding.get("to") is not None:
+                start = binding["from"]
+                end = binding["to"]
+                start_key = (start.get("line"), start.get("col", 1))
+                end_key = (end.get("line"), end.get("col", 1))
+                if end_key < start_key:
+                    raise LogicError("E_INVALID_REQUEST", "Code binding.to must not be before Code binding.from", {"id": binding_id})
+            if "hash" in binding and not isinstance(binding.get("hash"), str):
+                raise LogicError("E_INVALID_REQUEST", "Code binding.hash must be a string", {"id": binding_id})
 
             if not (
                 binding.get("related_rule_ids")
@@ -1043,7 +1249,7 @@ class LogicEngine:
                         {"id": binding_id, "ref": concept_id},
                     )
 
-            if not self._binding_has_anchor_path(binding_id, bindings, concepts):
+            if not self._binding_has_logic_path(binding_id, bindings, concepts):
                 raise LogicError(
                     "E_INVALID_REQUEST",
                     "Code binding must have a transitive path to a rule or expectation",
@@ -1111,18 +1317,29 @@ class LogicEngine:
         self._invalidate_cache()
 
     def set_rule(self, args: dict) -> dict:
+        self._reject_unknown_fields(
+            args,
+            allowed={"id", "lang", "rule", "intent", "motivation"},
+            where="logic_set_rule",
+        )
         item_id = args.get("id")
         lang = args.get("lang")
         rule = args.get("rule")
+        intent = args.get("intent")
+        motivation = args.get("motivation")
         if not isinstance(item_id, str) or not item_id:
             raise LogicError("E_INVALID_REQUEST", "Missing required field id")
         if lang not in {"pyexpr", "smt2"}:
             raise LogicError("E_INVALID_REQUEST", "Unsupported lang", {"lang": lang})
         if rule is None:
             raise LogicError("E_INVALID_REQUEST", "Missing required field rule")
+        if not isinstance(intent, str) or not intent.strip():
+            raise LogicError("E_INVALID_REQUEST", "Missing required field intent")
+        normalized_motivation = self._normalize_motivation(motivation)
 
         def mutate(data: dict) -> None:
             self._assert_id_available(data, item_id, "rule")
+            self._validate_motivated_by_item_exists(data, normalized_motivation, item_id=item_id)
             symbols = data.setdefault("symbols", {})
             if not isinstance(symbols, dict):
                 raise LogicError("E_INVALID_REQUEST", "symbols store is corrupted")
@@ -1131,12 +1348,23 @@ class LogicEngine:
                 self._compile_pyexpr(rule, z3_vars, symbols)
             else:
                 self._compile_smt2(item_id, rule, z3_vars, symbols)
-            self._versioned_set(data, "rules", item_id, lang=lang, content=rule)
+            self._versioned_set(
+                data,
+                "rules",
+                item_id,
+                lang=lang,
+                content=rule,
+                extra={
+                    "intent": intent.strip(),
+                    "motivation": copy.deepcopy(normalized_motivation),
+                },
+            )
 
         self._apply_persistent_mutation(mutate)
         return {"ok": True}
 
     def remove_rule(self, args: dict) -> dict:
+        self._reject_unknown_fields(args, allowed={"id"}, where="logic_remove_rule")
         item_id = args.get("id")
         if not isinstance(item_id, str) or not item_id:
             raise LogicError("E_INVALID_REQUEST", "Missing required field id")
@@ -1148,26 +1376,42 @@ class LogicEngine:
         return {"ok": True}
 
     def set_bundle(self, args: dict) -> dict:
+        self._reject_unknown_fields(
+            args,
+            allowed={"id", "bundle", "motivation"},
+            where="logic_set_bundle",
+        )
         item_id = args.get("id")
         bundle = args.get("bundle")
+        motivation = args.get("motivation")
         if not isinstance(item_id, str) or not item_id:
             raise LogicError("E_INVALID_REQUEST", "Missing required field id")
         if bundle is None:
             raise LogicError("E_INVALID_REQUEST", "Missing required field bundle")
+        normalized_motivation = self._normalize_motivation(motivation)
 
         def mutate(data: dict) -> None:
             self._assert_id_available(data, item_id, "bundle")
+            self._validate_motivated_by_item_exists(data, normalized_motivation, item_id=item_id)
             symbols = data.setdefault("symbols", {})
             if not isinstance(symbols, dict):
                 raise LogicError("E_INVALID_REQUEST", "symbols store is corrupted")
             z3_vars = self._build_z3_vars(symbols)
             self._compile_smt2(item_id, bundle, z3_vars, symbols)
-            self._versioned_set(data, "bundles", item_id, lang="smt2", content=bundle)
+            self._versioned_set(
+                data,
+                "bundles",
+                item_id,
+                lang="smt2",
+                content=bundle,
+                extra={"motivation": copy.deepcopy(normalized_motivation)},
+            )
 
         self._apply_persistent_mutation(mutate)
         return {"ok": True}
 
     def remove_bundle(self, args: dict) -> dict:
+        self._reject_unknown_fields(args, allowed={"id"}, where="logic_remove_bundle")
         item_id = args.get("id")
         if not isinstance(item_id, str) or not item_id:
             raise LogicError("E_INVALID_REQUEST", "Missing required field id")
@@ -1179,19 +1423,27 @@ class LogicEngine:
         return {"ok": True}
 
     def set_expectation(self, args: dict) -> dict:
+        self._reject_unknown_fields(
+            args,
+            allowed={"id", "kind", "a_ref", "b_ref", "motivation"},
+            where="logic_set_expectation",
+        )
         item_id = args.get("id")
         kind = args.get("kind")
         a_ref = args.get("a_ref")
         b_ref = args.get("b_ref")
+        motivation = args.get("motivation")
         if not isinstance(item_id, str) or not item_id:
             raise LogicError("E_INVALID_REQUEST", "Missing required field id")
         if kind not in {"entails", "equivalent"}:
             raise LogicError("E_INVALID_REQUEST", "Unsupported expectation kind", {"kind": kind})
         if not isinstance(a_ref, str) or not a_ref or not isinstance(b_ref, str) or not b_ref:
             raise LogicError("E_INVALID_REQUEST", "Expectation requires a_ref and b_ref")
+        normalized_motivation = self._normalize_motivation(motivation)
 
         def mutate(data: dict) -> None:
             self._assert_id_available(data, item_id, "expectation")
+            self._validate_motivated_by_item_exists(data, normalized_motivation, item_id=item_id)
             active_rules = self._active_items_from_data(data, "rules")
             if a_ref not in active_rules or b_ref not in active_rules:
                 raise LogicError(
@@ -1200,12 +1452,20 @@ class LogicEngine:
                     {"a_ref": a_ref, "b_ref": b_ref},
                 )
             content = {"kind": kind, "a_ref": a_ref, "b_ref": b_ref}
-            self._versioned_set(data, "expectations", item_id, lang="expect", content=content)
+            self._versioned_set(
+                data,
+                "expectations",
+                item_id,
+                lang="expect",
+                content=content,
+                extra={"motivation": copy.deepcopy(normalized_motivation)},
+            )
 
         self._apply_persistent_mutation(mutate)
         return {"ok": True}
 
     def remove_expectation(self, args: dict) -> dict:
+        self._reject_unknown_fields(args, allowed={"id"}, where="logic_remove_expectation")
         item_id = args.get("id")
         if not isinstance(item_id, str) or not item_id:
             raise LogicError("E_INVALID_REQUEST", "Missing required field id")
@@ -1216,10 +1476,54 @@ class LogicEngine:
         self._apply_persistent_mutation(mutate)
         return {"ok": True}
 
+    def reset_session(self, args: dict) -> dict:
+        self._reject_unknown_fields(args, allowed={"confirm", "wipe_logs"}, where="logic_reset")
+        confirm = args.get("confirm")
+        if confirm != "reset-session":
+            raise LogicError(
+                "E_INVALID_REQUEST",
+                "logic_reset requires confirm='reset-session'",
+            )
+        wipe_logs_raw = args.get("wipe_logs", True)
+        if not isinstance(wipe_logs_raw, bool):
+            raise LogicError("E_INVALID_REQUEST", "wipe_logs must be a boolean")
+        wipe_logs = wipe_logs_raw
+
+        self.store.data = {
+            "symbols": {},
+            "bundles": {},
+            "rules": {},
+            "expectations": {},
+            "defaults": {},
+            "context": {"concepts": {}, "code_bindings": {}},
+        }
+        self.store.save()
+        self._invalidate_cache()
+
+        removed_logs = False
+        if wipe_logs:
+            log_path = self.store.session_dir / "log.jsonl"
+            if log_path.exists():
+                try:
+                    log_path.unlink()
+                    removed_logs = True
+                except Exception:
+                    removed_logs = False
+        return {
+            "ok": True,
+            "result": {
+                "session_id": self.store.session_id,
+                "wiped_inventory": True,
+                "wiped_logs": removed_logs,
+            },
+        }
+
     def context_patch(self, args: dict) -> dict:
+        self._reject_unknown_fields(args, allowed={"ops"}, where="logic_context_patch")
         ops = args.get("ops")
         if not isinstance(ops, list):
             raise LogicError("E_INVALID_REQUEST", "ops must be an array")
+        warnings: list[dict[str, Any]] = []
 
         def mutate(data: dict) -> None:
             self._ensure_context_root(data)
@@ -1241,6 +1545,7 @@ class LogicEngine:
                     set_payload = op.get("set")
                     if not isinstance(set_payload, dict):
                         raise LogicError("E_INVALID_REQUEST", "set_concept requires set object", {"id": item_id})
+                    is_new = item_id not in concepts
                     current = copy.deepcopy(concepts.get(item_id, {"id": item_id}))
                     current["id"] = item_id
                     for key, value in set_payload.items():
@@ -1256,6 +1561,13 @@ class LogicEngine:
                         raise LogicError("E_INVALID_REQUEST", "Concept.concept must be non-empty string", {"id": item_id})
                     if not isinstance(current["meaning"], str) or not current["meaning"]:
                         raise LogicError("E_INVALID_REQUEST", "Concept.meaning must be non-empty string", {"id": item_id})
+                    if "source_ref" in current:
+                        raise LogicError("E_INVALID_REQUEST", "Concept.source_ref is no longer supported", {"id": item_id})
+                    if "motivation" not in current:
+                        raise LogicError("E_INVALID_REQUEST", "Concept missing required field motivation", {"id": item_id})
+                    normalized_motivation = self._normalize_motivation(current.get("motivation"))
+                    if is_new or "motivation" in set_payload:
+                        self._validate_motivated_by_item_exists(data, normalized_motivation, item_id=item_id)
                     normalized = {
                         "id": item_id,
                         "concept": current["concept"],
@@ -1268,12 +1580,15 @@ class LogicEngine:
                         "related_code_binding_ids": self._normalize_string_list(
                             current["related_code_binding_ids"], "related_code_binding_ids"
                         ),
+                        "motivation": normalized_motivation,
                     }
-                    if "source_ref" in current and current["source_ref"] is not None:
-                        if not isinstance(current["source_ref"], str):
-                            raise LogicError("E_INVALID_REQUEST", "Concept.source_ref must be a string", {"id": item_id})
-                        if current["source_ref"]:
-                            normalized["source_ref"] = current["source_ref"]
+                    previous = concepts.get(item_id)
+                    previous_version = previous.get("version") if isinstance(previous, dict) else None
+                    if isinstance(previous_version, (int, float)) and not isinstance(previous_version, bool):
+                        normalized["version"] = max(1, int(previous_version) + 1)
+                    else:
+                        normalized["version"] = 1
+                    normalized["created_at"] = time.time()
                     concepts[item_id] = normalized
                 elif op_name == "remove_concept":
                     if item_id not in concepts:
@@ -1284,6 +1599,7 @@ class LogicEngine:
                     set_payload = op.get("set")
                     if not isinstance(set_payload, dict):
                         raise LogicError("E_INVALID_REQUEST", "set_code_binding requires set object", {"id": item_id})
+                    is_new = item_id not in bindings
                     current = copy.deepcopy(bindings.get(item_id, {"id": item_id}))
                     current["id"] = item_id
                     for key, value in set_payload.items():
@@ -1299,6 +1615,8 @@ class LogicEngine:
                                 f"Code binding missing required field {field}",
                                 {"id": item_id},
                             )
+                    if "motivation" not in current:
+                        raise LogicError("E_INVALID_REQUEST", "Code binding missing required field motivation", {"id": item_id})
                     normalized = {
                         "id": item_id,
                         "path": self._normalize_rel_path(current["path"]),
@@ -1313,76 +1631,85 @@ class LogicEngine:
                     }
                     if normalized["kind"] not in {"source", "document"}:
                         raise LogicError("E_INVALID_REQUEST", "Code binding.kind must be source|document", {"id": item_id})
-                    if "function_or_behavior" in current and current["function_or_behavior"] is not None:
-                        if not isinstance(current["function_or_behavior"], str):
-                            raise LogicError("E_INVALID_REQUEST", "function_or_behavior must be a string", {"id": item_id})
-                        if current["function_or_behavior"]:
-                            normalized["function_or_behavior"] = current["function_or_behavior"]
+                    if "function_or_behavior" in current:
+                        raise LogicError("E_INVALID_REQUEST", "Code binding.function_or_behavior is no longer supported", {"id": item_id})
                     if "symbols_used" in current and current["symbols_used"] is not None:
                         normalized["symbols_used"] = self._normalize_string_list(current["symbols_used"], "symbols_used")
-                    if "anchor" in current and current["anchor"] is not None:
-                        anchor = self._normalize_anchor(current["anchor"])
-                        if anchor:
-                            normalized["anchor"] = anchor
+                    if "line_excerpt" in current and current["line_excerpt"] is not None:
+                        if not isinstance(current["line_excerpt"], str):
+                            raise LogicError("E_INVALID_REQUEST", "Code binding.line_excerpt must be a string", {"id": item_id})
+                        normalized["line_excerpt"] = current["line_excerpt"]
+                    from_value = current.get("from")
+                    to_value = current.get("to")
+                    if to_value is not None and from_value is None:
+                        current.pop("to", None)
+                        to_value = None
+                        warnings.append(
+                            {
+                                "code": "W_BINDING_TO_WITHOUT_FROM",
+                                "message": "Code binding.to was ignored because Code binding.from was not provided.",
+                                "details": {"id": item_id},
+                            }
+                        )
+                    if from_value is not None:
+                        normalized["from"] = self._normalize_line_location(from_value, "from")
+                    if to_value is not None:
+                        normalized["to"] = self._normalize_line_location(to_value, "to")
+                    if "from" in normalized and "to" in normalized:
+                        start = normalized["from"]
+                        end = normalized["to"]
+                        start_key = (start.get("line"), start.get("col", 1))
+                        end_key = (end.get("line"), end.get("col", 1))
+                        if end_key < start_key:
+                            raise LogicError("E_INVALID_REQUEST", "Code binding.to must not be before Code binding.from", {"id": item_id})
+                    normalized_motivation = self._normalize_motivation(current.get("motivation"))
+                    if is_new or "motivation" in set_payload:
+                        self._validate_motivated_by_item_exists(data, normalized_motivation, item_id=item_id)
+                    normalized["motivation"] = normalized_motivation
+                    normalized["hash"] = self._binding_hash(normalized)
+                    previous = bindings.get(item_id)
+                    previous_version = previous.get("version") if isinstance(previous, dict) else None
+                    if isinstance(previous_version, (int, float)) and not isinstance(previous_version, bool):
+                        normalized["version"] = max(1, int(previous_version) + 1)
+                    else:
+                        normalized["version"] = 1
+                    normalized["created_at"] = time.time()
                     bindings[item_id] = normalized
                 elif op_name == "remove_code_binding":
                     if item_id not in bindings:
                         raise LogicError("E_UNKNOWN_ID", "Code binding id does not exist", {"id": item_id})
                     bindings.pop(item_id, None)
-                elif op_name == "set_rule_meta":
-                    set_payload = op.get("set")
-                    if not isinstance(set_payload, dict):
-                        raise LogicError("E_INVALID_REQUEST", "set_rule_meta requires set object", {"id": item_id})
-                    entry = self._active_version_entry(data, "rules", item_id)
-                    meta = entry.get("meta")
-                    if not isinstance(meta, dict):
-                        meta = {}
-                    for key, value in set_payload.items():
-                        if value is None:
-                            meta.pop(key, None)
-                        else:
-                            meta[key] = value
-                    if meta:
-                        entry["meta"] = meta
-                    else:
-                        entry.pop("meta", None)
-                elif op_name == "set_expectation_meta":
-                    set_payload = op.get("set")
-                    if not isinstance(set_payload, dict):
-                        raise LogicError("E_INVALID_REQUEST", "set_expectation_meta requires set object", {"id": item_id})
-                    entry = self._active_version_entry(data, "expectations", item_id)
-                    meta = entry.get("meta")
-                    if not isinstance(meta, dict):
-                        meta = {}
-                    for key, value in set_payload.items():
-                        if value is None:
-                            meta.pop(key, None)
-                        else:
-                            meta[key] = value
-                    if meta:
-                        entry["meta"] = meta
-                    else:
-                        entry.pop("meta", None)
                 else:
                     raise LogicError("E_INVALID_REQUEST", f"Unknown context op {op_name}")
 
         self._apply_persistent_mutation(mutate)
-        return {"ok": True}
+        return self._with_warnings({"ok": True}, warnings)
 
-    def _render_list_item(self, item_type: str, item_id: str, payload: dict, detail_level: str) -> dict:
+    def _render_list_item(
+        self,
+        item_type: str,
+        item_id: str,
+        payload: dict,
+        detail_level: str,
+        *,
+        universe_ids: Optional[set[str]] = None,
+    ) -> dict:
+        if universe_ids is None:
+            universe_ids = set(self._item_universe().keys())
+        motivation = self._motivation_for_output(payload, universe_ids)
+
         if item_type in {"bundle", "rule"}:
-            item = {"id": item_id, "type": item_type}
-            if detail_level == "minimal":
-                item["lang"] = payload.get("lang")
-            elif detail_level in {"compact", "more"}:
-                item["lang"] = payload.get("lang")
+            item = {"id": item_id, "type": item_type, "lang": payload.get("lang")}
+            if detail_level in {"compact", "more"}:
                 item["summary"] = self._summarize(payload.get("content"))
-            else:
-                item["lang"] = payload.get("lang")
+            if item_type == "rule" and detail_level in {"compact", "more", "full"}:
+                item["intent"] = payload.get("intent")
+            if item_type == "rule" and detail_level in {"more", "full"}:
+                item["related_code_bindings"] = self._related_binding_refs("rule", item_id)
+            if detail_level == "full":
                 item["version"] = payload.get("version")
                 item["content"] = payload.get("content")
-                if isinstance(payload.get("meta"), dict):
-                    item["meta"] = payload["meta"]
+                item["motivation"] = motivation
             return self._strip_empty(item)
 
         if item_type == "expectation":
@@ -1391,10 +1718,11 @@ class LogicEngine:
             if detail_level in {"compact", "more", "full"}:
                 item["a_ref"] = content.get("a_ref")
                 item["b_ref"] = content.get("b_ref")
+            if detail_level in {"more", "full"}:
+                item["related_code_bindings"] = self._related_binding_refs("expectation", item_id)
             if detail_level == "full":
                 item["version"] = payload.get("version")
-                if isinstance(payload.get("meta"), dict):
-                    item["meta"] = payload["meta"]
+                item["motivation"] = motivation
             return self._strip_empty(item)
 
         if item_type == "concept":
@@ -1419,21 +1747,45 @@ class LogicEngine:
                         "related_rule_ids": payload.get("related_rule_ids"),
                         "related_expectation_ids": payload.get("related_expectation_ids"),
                         "related_code_binding_ids": payload.get("related_code_binding_ids"),
+                        "related_code_bindings": self._related_binding_refs("concept", item_id),
                     }
                 )
-            return self._strip_empty({"id": item_id, "type": "concept", **payload})
+            return self._strip_empty(
+                {
+                    "id": item_id,
+                    "type": "concept",
+                    "concept": payload.get("concept"),
+                    "meaning": payload.get("meaning"),
+                    "primary_symbols": payload.get("primary_symbols"),
+                    "related_rule_ids": payload.get("related_rule_ids"),
+                    "related_expectation_ids": payload.get("related_expectation_ids"),
+                    "related_code_binding_ids": payload.get("related_code_binding_ids"),
+                    "related_code_bindings": self._related_binding_refs("concept", item_id),
+                    "motivation": motivation,
+                    "version": payload.get("version"),
+                }
+            )
 
         # code_binding
         if detail_level == "minimal":
-            return self._strip_empty({"id": item_id, "type": "code_binding", "path": payload.get("path")})
+            return self._strip_empty(
+                {
+                    "id": item_id,
+                    "type": "code_binding",
+                    "path": payload.get("path"),
+                    "from": payload.get("from"),
+                    "to": payload.get("to"),
+                }
+            )
         if detail_level == "compact":
             return self._strip_empty(
                 {
                     "id": item_id,
                     "type": "code_binding",
                     "path": payload.get("path"),
+                    "from": payload.get("from"),
+                    "to": payload.get("to"),
                     "kind": payload.get("kind", "source"),
-                    "function_or_behavior": payload.get("function_or_behavior"),
                 }
             )
         if detail_level == "more":
@@ -1442,14 +1794,30 @@ class LogicEngine:
                     "id": item_id,
                     "type": "code_binding",
                     "path": payload.get("path"),
+                    "from": payload.get("from"),
+                    "to": payload.get("to"),
                     "kind": payload.get("kind", "source"),
-                    "function_or_behavior": payload.get("function_or_behavior"),
                     "related_rule_ids": payload.get("related_rule_ids"),
                     "related_expectation_ids": payload.get("related_expectation_ids"),
                     "related_concept_ids": payload.get("related_concept_ids"),
                 }
             )
-        return self._strip_empty({"id": item_id, "type": "code_binding", **payload})
+        return self._strip_empty(
+            {
+                "id": item_id,
+                "type": "code_binding",
+                "path": payload.get("path"),
+                "from": payload.get("from"),
+                "to": payload.get("to"),
+                "kind": payload.get("kind", "source"),
+                "line_excerpt": payload.get("line_excerpt"),
+                "related_rule_ids": payload.get("related_rule_ids"),
+                "related_expectation_ids": payload.get("related_expectation_ids"),
+                "related_concept_ids": payload.get("related_concept_ids"),
+                "symbols_used": payload.get("symbols_used"),
+                "motivation": motivation,
+            }
+        )
 
     def _item_universe(self) -> Dict[str, tuple[str, dict]]:
         self._ensure_context_root(self.store.data)
@@ -1485,7 +1853,11 @@ class LogicEngine:
         if item_id not in universe:
             raise LogicError("E_UNKNOWN_ID", "id does not exist", {"id": item_id})
         entry_type, payload = universe[item_id]
-        return {"ok": True, "result": {"item": self._render_list_item(entry_type, item_id, payload, detail_level)}}
+        universe_ids = set(universe.keys())
+        return {
+            "ok": True,
+            "result": {"item": self._render_list_item(entry_type, item_id, payload, detail_level, universe_ids=universe_ids)},
+        }
 
     def list_items(self, args: dict) -> dict:
         detail_level = args.get("detail_level", "compact")
@@ -1543,7 +1915,11 @@ class LogicEngine:
                 raise LogicError("E_INVALID_REQUEST", "cursor must be a decimal offset string")
             start = int(cursor)
         page = selected[start : start + limit]
-        items = [self._render_list_item(item_type, item_id, payload, detail_level) for item_type, item_id, payload in page]
+        universe_ids = set(universe.keys())
+        items = [
+            self._render_list_item(item_type, item_id, payload, detail_level, universe_ids=universe_ids)
+            for item_type, item_id, payload in page
+        ]
         result = {"items": items}
         next_idx = start + len(page)
         if next_idx < len(selected):
@@ -1562,6 +1938,11 @@ class LogicEngine:
         return self._strip_empty({"baseline": sorted(baseline), "candidate": sorted(candidate)})
 
     def check_v5(self, args: dict) -> dict:
+        self._reject_unknown_fields(
+            args,
+            allowed={"hypothesis", "detail_level", "return_model", "model_scope", "model_symbols", "include_metrics"},
+            where="logic_check",
+        )
         detail_level = args.get("detail_level", "compact")
         if detail_level not in {"minimal", "compact", "more", "full"}:
             raise LogicError("E_INVALID_REQUEST", "detail_level must be one of minimal|compact|more|full")
@@ -1569,11 +1950,28 @@ class LogicEngine:
         hypothesis = args.get("hypothesis", {}) or {}
         if not isinstance(hypothesis, dict):
             raise LogicError("E_INVALID_REQUEST", "hypothesis must be an object")
+        unknown_hypothesis_fields = sorted(
+            field for field in hypothesis.keys() if field not in {"facts", "assumptions", "patch"}
+        )
+        if unknown_hypothesis_fields:
+            raise LogicError(
+                "E_INVALID_REQUEST",
+                "hypothesis contains unsupported fields",
+                {"unsupported_fields": unknown_hypothesis_fields},
+            )
         patch = hypothesis.get("patch", {}) or {}
         if not isinstance(patch, dict):
             raise LogicError("E_INVALID_REQUEST", "hypothesis.patch must be an object")
+        unknown_patch_fields = sorted(field for field in patch.keys() if field not in {"set_rules", "remove_rules"})
+        if unknown_patch_fields:
+            raise LogicError(
+                "E_INVALID_REQUEST",
+                "hypothesis.patch contains unsupported fields",
+                {"unsupported_fields": unknown_patch_fields},
+            )
         set_rules = patch.get("set_rules", {}) or {}
         remove_rules = patch.get("remove_rules", []) or []
+        assumptions = self._normalize_hypothesis_assumptions(hypothesis.get("assumptions", []) or [])
         if not isinstance(set_rules, dict):
             raise LogicError("E_INVALID_REQUEST", "hypothesis.patch.set_rules must be an object")
         if not isinstance(remove_rules, list):
@@ -1601,19 +1999,58 @@ class LogicEngine:
             else:
                 patch_add[rid] = {"lang": lang, "rule": content}
 
+        return_model_raw = args.get("return_model")
+        if return_model_raw is None:
+            return_model = detail_level in {"compact", "more", "full"}
+        elif isinstance(return_model_raw, bool):
+            return_model = return_model_raw
+        else:
+            raise LogicError("E_INVALID_REQUEST", "return_model must be a boolean")
+
+        model_scope = args.get("model_scope")
+        if model_scope is None:
+            model_scope = MODEL_SCOPE_ALL if detail_level == "full" else MODEL_SCOPE_FACTS
+        if model_scope not in MODEL_SCOPE_VALUES:
+            raise LogicError(
+                "E_INVALID_REQUEST",
+                "model_scope must be one of none|facts|all|selected",
+            )
+
+        model_symbols_raw = args.get("model_symbols", [])
+        if not isinstance(model_symbols_raw, list):
+            raise LogicError("E_INVALID_REQUEST", "model_symbols must be an array")
+        model_symbols: List[str] = []
+        for symbol in model_symbols_raw:
+            if not isinstance(symbol, str) or not symbol:
+                raise LogicError("E_INVALID_REQUEST", "model_symbols entries must be non-empty strings")
+            if symbol not in model_symbols:
+                model_symbols.append(symbol)
+
+        include_metrics_raw = args.get("include_metrics")
+        if include_metrics_raw is None:
+            include_metrics = detail_level != "minimal"
+        elif isinstance(include_metrics_raw, bool):
+            include_metrics = include_metrics_raw
+        else:
+            raise LogicError("E_INVALID_REQUEST", "include_metrics must be a boolean")
+
         options = {
             "timeout_ms": DEFAULT_TIMEOUT_MS,
             "fail_on_timeout": False,
             "check_expectations": None,
+            "model_scope": model_scope,
+            "model_symbols": model_symbols,
+            "assumptions": assumptions,
+            "include_metrics": include_metrics,
         }
         if detail_level == "minimal":
-            options.update({"analyse_influence": False, "return_models": False, "return_unsat_core": False})
+            options.update({"analyse_influence": False, "return_models": return_model, "return_unsat_core": False})
         elif detail_level == "compact":
-            options.update({"analyse_influence": False, "return_models": False, "return_unsat_core": False})
+            options.update({"analyse_influence": False, "return_models": return_model, "return_unsat_core": False})
         elif detail_level == "more":
-            options.update({"analyse_influence": True, "return_models": False, "return_unsat_core": True})
+            options.update({"analyse_influence": True, "return_models": return_model, "return_unsat_core": True})
         else:
-            options.update({"analyse_influence": True, "return_models": True, "return_unsat_core": True})
+            options.update({"analyse_influence": True, "return_models": return_model, "return_unsat_core": True})
 
         legacy_args = {
             "hypothesis": {
@@ -1633,24 +2070,30 @@ class LogicEngine:
             "candidate": {"status": result.get("candidate", {}).get("status")},
             "breaks": result.get("breaks"),
         }
+        if isinstance(result.get("baseline"), dict) and "reason" in result["baseline"]:
+            out.setdefault("baseline", {})["reason"] = result["baseline"]["reason"]
+        if isinstance(result.get("candidate"), dict) and "reason" in result["candidate"]:
+            out.setdefault("candidate", {})["reason"] = result["candidate"]["reason"]
         if detail_level != "minimal":
             out["delta"] = result.get("delta", {})
             out["expectation_failures"] = self._check_expectation_failures(result.get("expectations", {}))
+        if isinstance(result.get("baseline"), dict) and "unsat_core" in result["baseline"]:
+            out.setdefault("baseline", {})["unsat_core"] = result["baseline"]["unsat_core"]
+        if isinstance(result.get("candidate"), dict) and "unsat_core" in result["candidate"]:
+            out.setdefault("candidate", {})["unsat_core"] = result["candidate"]["unsat_core"]
+        if isinstance(result.get("baseline"), dict) and "model" in result["baseline"]:
+            out.setdefault("baseline", {})["model"] = result["baseline"]["model"]
+        if isinstance(result.get("candidate"), dict) and "model" in result["candidate"]:
+            out.setdefault("candidate", {})["model"] = result["candidate"]["model"]
         if detail_level in {"more", "full"}:
-            if isinstance(result.get("baseline"), dict) and "unsat_core" in result["baseline"]:
-                out.setdefault("baseline", {})["unsat_core"] = result["baseline"]["unsat_core"]
-            if isinstance(result.get("candidate"), dict) and "unsat_core" in result["candidate"]:
-                out.setdefault("candidate", {})["unsat_core"] = result["candidate"]["unsat_core"]
             out["expectations"] = result.get("expectations", {})
             if isinstance(result.get("influence"), dict):
                 out["influence"] = {"patch_influence": result["influence"].get("patch_influence")}
         if detail_level == "full":
-            if isinstance(result.get("baseline"), dict) and "model" in result["baseline"]:
-                out.setdefault("baseline", {})["model"] = result["baseline"]["model"]
-            if isinstance(result.get("candidate"), dict) and "model" in result["candidate"]:
-                out.setdefault("candidate", {})["model"] = result["candidate"]["model"]
             if isinstance(result.get("influence"), dict):
                 out["influence"] = result["influence"]
+        if include_metrics and isinstance(result.get("metrics"), dict):
+            out["metrics"] = result["metrics"]
         return {"ok": True, "result": self._strip_empty(out)}
 
     def _parse_fact(self, name: str, value: Any, local_symbols: Dict[str, str]) -> Tuple[Optional[z3.ExprRef], Optional[str]]:
@@ -1685,11 +2128,17 @@ class LogicEngine:
             if existing and existing not in {TYPE_INT, TYPE_REAL}:
                 raise LogicError("E_INVALID_REQUEST", f"Fact type mismatch for {name}: expected {existing}, got Int")
             local_symbols.setdefault(name, TYPE_INT)
+            if existing == TYPE_REAL:
+                return z3.RealVal(str(value)), None
             return z3.IntVal(value), None
         if isinstance(value, float):
             existing = local_symbols.get(name)
             if existing and existing == TYPE_BOOL:
                 raise LogicError("E_INVALID_REQUEST", f"Fact type mismatch for {name}: expected Bool, got Real")
+            if existing == TYPE_INT:
+                if value.is_integer():
+                    return z3.IntVal(int(value)), None
+                raise LogicError("E_INVALID_REQUEST", f"Fact type mismatch for {name}: expected Int, got Real({value})")
             local_symbols.setdefault(name, TYPE_REAL)
             return z3.RealVal(str(value)), None
         raise LogicError("E_INVALID_REQUEST", f"Unsupported fact value for {name}")
@@ -1712,6 +2161,76 @@ class LogicEngine:
             else:
                 result[name] = str(val)
         return result
+
+    def _resolve_model_symbols(
+        self,
+        *,
+        scope: str,
+        fact_symbols: Iterable[str],
+        symbol_table: Dict[str, str],
+        selected_symbols: Iterable[str],
+    ) -> List[str]:
+        if scope == MODEL_SCOPE_NONE:
+            return []
+        if scope == MODEL_SCOPE_ALL:
+            return sorted(symbol_table.keys())
+        if scope == MODEL_SCOPE_SELECTED:
+            return sorted(name for name in selected_symbols if name in symbol_table)
+        return sorted(set(fact_symbols))
+
+    def _normalize_hypothesis_assumptions(self, assumptions: Any) -> List[dict]:
+        if assumptions is None:
+            return []
+        if not isinstance(assumptions, list):
+            raise LogicError("E_INVALID_REQUEST", "hypothesis.assumptions must be an array")
+        normalized: List[dict] = []
+        seen_ids: set[str] = set()
+        for idx, item in enumerate(assumptions):
+            if not isinstance(item, dict):
+                raise LogicError("E_INVALID_REQUEST", "hypothesis.assumptions entries must be objects")
+            lang = item.get("lang")
+            rule = item.get("rule")
+            item_id = item.get("id")
+            if lang not in {"pyexpr", "smt2"} or rule is None:
+                raise LogicError("E_INVALID_REQUEST", "Invalid hypothesis assumption", {"index": idx})
+            if item_id is None:
+                normalized_id = f"assumption_{idx + 1}"
+            elif isinstance(item_id, str) and item_id:
+                normalized_id = item_id
+            else:
+                raise LogicError("E_INVALID_REQUEST", "assumption.id must be a non-empty string", {"index": idx})
+            if normalized_id in seen_ids:
+                raise LogicError("E_INVALID_REQUEST", "Duplicate assumption id", {"id": normalized_id})
+            seen_ids.add(normalized_id)
+            normalized.append({"id": normalized_id, "lang": lang, "rule": rule})
+        return normalized
+
+    def _compile_hypothesis_assumptions(
+        self,
+        *,
+        solver: z3.Solver,
+        assumptions: List[dict],
+        z3_vars: Dict[str, z3.ExprRef],
+        symbol_table: Dict[str, str],
+        track: Dict[str, str],
+        prefix: str,
+    ) -> List[z3.BoolRef]:
+        lits: List[z3.BoolRef] = []
+        for assumption in assumptions:
+            aid = assumption["id"]
+            bundle = self._compile_rule_bundle(
+                f"{prefix}:{aid}",
+                {"id": aid, "lang": assumption["lang"], "content": assumption["rule"]},
+                z3_vars,
+                symbol_table,
+            )
+            for idx, expr in enumerate(bundle.assertions):
+                lit_name = self._assumption_name(f"{prefix}_assumption", aid, idx)
+                lit = z3.Bool(lit_name)
+                solver.add(z3.Implies(lit, expr))
+                lits.append(lit)
+                track[lit_name] = aid
+        return lits
 
     def _compile_rule_bundle(
         self,
@@ -1889,41 +2408,23 @@ class LogicEngine:
                 results[exp_id] = ExpectationResult(status="unknown", reason="unsupported")
                 continue
             try:
-                # v5 shape: {"kind","a_ref","b_ref"}; keep legacy support for stored v4/v3 forms.
                 a_ref = expect.get("a_ref")
                 b_ref = expect.get("b_ref")
-                if not a_ref:
-                    a = expect.get("a", {})
-                    a_ref = a.get("ref") if isinstance(a, dict) else None
-                if not a_ref:
+                if not isinstance(a_ref, str) or not a_ref:
                     raise LogicError("E_INVALID_REQUEST", "Expectation missing a_ref")
+                if not isinstance(b_ref, str) or not b_ref:
+                    raise LogicError("E_INVALID_REQUEST", "Expectation missing b_ref")
                 if a_ref in active_rules:
                     a_entry = active_rules[a_ref]
                 else:
                     a_entry = self.store.get_latest_item("rules", a_ref)
                 a_expr = self._compile_rule_expr({**a_entry, "id": a_ref}, z3_vars, local_symbols)
 
-                if b_ref:
-                    if b_ref in active_rules:
-                        b_entry = active_rules[b_ref]
-                    else:
-                        b_entry = self.store.get_latest_item("rules", b_ref)
-                    b_expr = self._compile_rule_expr({**b_entry, "id": b_ref}, z3_vars, local_symbols)
+                if b_ref in active_rules:
+                    b_entry = active_rules[b_ref]
                 else:
-                    b = expect.get("b", {})
-                    if not isinstance(b, dict):
-                        raise LogicError("E_INVALID_REQUEST", "Expectation missing b_ref")
-                    if "ref" in b:
-                        b_ref = b.get("ref")
-                        if b_ref in active_rules:
-                            b_entry = active_rules[b_ref]
-                        else:
-                            b_entry = self.store.get_latest_item("rules", b_ref)
-                        b_expr = self._compile_rule_expr({**b_entry, "id": b_ref}, z3_vars, local_symbols)
-                    else:
-                        b_expr_str = b.get("expr")
-                        compiler = PyExprCompiler(local_symbols)
-                        b_expr, _ = compiler.compile(b_expr_str, z3_vars)
+                    b_entry = self.store.get_latest_item("rules", b_ref)
+                b_expr = self._compile_rule_expr({**b_entry, "id": b_ref}, z3_vars, local_symbols)
 
                 # helper to check entailment
                 def entails(left_expr: z3.BoolRef, right_expr: z3.BoolRef) -> ExpectationResult:
@@ -1961,6 +2462,7 @@ class LogicEngine:
         return results
 
     def check(self, args: dict) -> dict:
+        check_started = time.perf_counter()
         hypothesis = args.get("hypothesis", {}) or {}
         facts = hypothesis.get("facts", {}) or {}
         patch = hypothesis.get("patch", {}) or {}
@@ -1973,6 +2475,23 @@ class LogicEngine:
         return_models = options.get("return_models", True)
         return_unsat_core = options.get("return_unsat_core", True)
         check_expectations = options.get("check_expectations")
+        include_metrics_raw = options.get("include_metrics", False)
+        if not isinstance(include_metrics_raw, bool):
+            raise LogicError("E_INVALID_REQUEST", "options.include_metrics must be a boolean")
+        include_metrics = include_metrics_raw
+        model_scope = options.get("model_scope", MODEL_SCOPE_FACTS)
+        if model_scope not in MODEL_SCOPE_VALUES:
+            raise LogicError("E_INVALID_REQUEST", "options.model_scope must be one of none|facts|all|selected")
+        model_symbols_raw = options.get("model_symbols", []) or []
+        if not isinstance(model_symbols_raw, list):
+            raise LogicError("E_INVALID_REQUEST", "options.model_symbols must be an array")
+        model_symbols: List[str] = []
+        for symbol in model_symbols_raw:
+            if not isinstance(symbol, str) or not symbol:
+                raise LogicError("E_INVALID_REQUEST", "options.model_symbols entries must be non-empty strings")
+            if symbol not in model_symbols:
+                model_symbols.append(symbol)
+        normalized_assumptions = self._normalize_hypothesis_assumptions(options.get("assumptions", []) or [])
         timeout_raw = options.get("timeout_ms", DEFAULT_TIMEOUT_MS)
         if not isinstance(timeout_raw, int) or timeout_raw < 1:
             raise LogicError("E_INVALID_REQUEST", "options.timeout_ms must be a positive integer")
@@ -2038,6 +2557,7 @@ class LogicEngine:
             solver = base_context.solver
 
             # Baseline check
+            baseline_started = time.perf_counter()
             solver.push()
             try:
                 baseline_symbols = dict(base_context.symbol_table)
@@ -2046,6 +2566,16 @@ class LogicEngine:
                 baseline_fact_symbols = self._apply_facts(solver, effective_facts, baseline_z3_vars, baseline_symbols)
                 baseline_assumptions = self._active_assumptions(base_context, set(active_rules.keys()))
                 baseline_track = dict(base_context.assumption_to_item)
+                baseline_assumptions.extend(
+                    self._compile_hypothesis_assumptions(
+                        solver=solver,
+                        assumptions=normalized_assumptions,
+                        z3_vars=baseline_z3_vars,
+                        symbol_table=baseline_symbols,
+                        track=baseline_track,
+                        prefix="baseline",
+                    )
+                )
                 baseline_status, baseline_reason = self._check_solver(solver, baseline_assumptions)
                 if fail_on_timeout and baseline_status == "unknown" and self._is_timeout_reason(baseline_reason):
                     raise LogicError("E_TIMEOUT", "Baseline check timed out")
@@ -2056,14 +2586,21 @@ class LogicEngine:
                 if baseline_status == "unsat" and return_unsat_core:
                     baseline_unsat_core = self._extract_unsat_core(solver, baseline_track)
                     baseline_result["unsat_core"] = baseline_unsat_core
-                baseline_model_symbols = set(baseline_fact_symbols)
+                baseline_model_symbols = self._resolve_model_symbols(
+                    scope=model_scope,
+                    fact_symbols=baseline_fact_symbols,
+                    symbol_table=baseline_symbols,
+                    selected_symbols=model_symbols,
+                )
                 if baseline_status == "sat" and return_models:
                     model = solver.model()
                     baseline_result["model"] = self._model_to_json(model, baseline_model_symbols, baseline_z3_vars)
             finally:
                 solver.pop()
+            baseline_duration_ms = int((time.perf_counter() - baseline_started) * 1000)
 
             # Candidate check
+            candidate_started = time.perf_counter()
             solver.push()
             try:
                 candidate_symbols = dict(base_context.symbol_table)
@@ -2096,6 +2633,17 @@ class LogicEngine:
                         candidate_assumptions.append(lit)
                         candidate_track[lit_name] = rid
 
+                candidate_assumptions.extend(
+                    self._compile_hypothesis_assumptions(
+                        solver=solver,
+                        assumptions=normalized_assumptions,
+                        z3_vars=candidate_z3_vars,
+                        symbol_table=candidate_symbols,
+                        track=candidate_track,
+                        prefix="candidate",
+                    )
+                )
+
                 candidate_status, candidate_reason = self._check_solver(solver, candidate_assumptions)
                 if fail_on_timeout and candidate_status == "unknown" and self._is_timeout_reason(candidate_reason):
                     raise LogicError("E_TIMEOUT", "Candidate check timed out")
@@ -2106,12 +2654,18 @@ class LogicEngine:
                 if candidate_status == "unsat" and return_unsat_core:
                     candidate_unsat_core = self._extract_unsat_core(solver, candidate_track)
                     candidate_result["unsat_core"] = candidate_unsat_core
-                candidate_model_symbols = set(candidate_fact_symbols)
+                candidate_model_symbols = self._resolve_model_symbols(
+                    scope=model_scope,
+                    fact_symbols=candidate_fact_symbols,
+                    symbol_table=candidate_symbols,
+                    selected_symbols=model_symbols,
+                )
                 if candidate_status == "sat" and return_models:
                     model = solver.model()
                     candidate_result["model"] = self._model_to_json(model, candidate_model_symbols, candidate_z3_vars)
             finally:
                 solver.pop()
+            candidate_duration_ms = int((time.perf_counter() - candidate_started) * 1000)
 
         breaks = baseline_status == "sat" and candidate_status != "sat"
 
@@ -2131,6 +2685,16 @@ class LogicEngine:
                     solver.set(timeout=timeout_ms)
                     self._apply_facts(solver, effective_facts, baseline_z3_vars, baseline_symbols)
                     baseline_assumptions = self._active_assumptions(base_context, set(active_rules.keys()))
+                    baseline_assumptions.extend(
+                        self._compile_hypothesis_assumptions(
+                            solver=solver,
+                            assumptions=normalized_assumptions,
+                            z3_vars=baseline_z3_vars,
+                            symbol_table=baseline_symbols,
+                            track={},
+                            prefix="exp_baseline",
+                        )
+                    )
                     baseline_expect = self._check_expectations(
                         active_expectations,
                         solver,
@@ -2166,6 +2730,16 @@ class LogicEngine:
                             lit = z3.Bool(self._assumption_name("exp_patch_add", rid, idx))
                             solver.add(z3.Implies(lit, expr))
                             candidate_assumptions.append(lit)
+                    candidate_assumptions.extend(
+                        self._compile_hypothesis_assumptions(
+                            solver=solver,
+                            assumptions=normalized_assumptions,
+                            z3_vars=candidate_z3_vars,
+                            symbol_table=candidate_symbols,
+                            track={},
+                            prefix="exp_candidate",
+                        )
+                    )
                     candidate_expect = self._check_expectations(
                         active_expectations,
                         solver,
@@ -2228,6 +2802,17 @@ class LogicEngine:
                         self._apply_facts(solver, effective_facts, z3_vars, symbols)
                         solver.add(z3.Not(expr))
                         assumptions = self._active_assumptions(base_context, enabled_rule_ids)
+                        track: Dict[str, str] = {}
+                        assumptions.extend(
+                            self._compile_hypothesis_assumptions(
+                                solver=solver,
+                                assumptions=normalized_assumptions,
+                                z3_vars=z3_vars,
+                                symbol_table=symbols,
+                                track=track,
+                                prefix="influence",
+                            )
+                        )
                         status, _ = self._check_solver(solver, assumptions)
                         return status
                     finally:
@@ -2349,6 +2934,24 @@ class LogicEngine:
             delta["no_longer_failed"] = sorted(baseline_failed - candidate_failed)
             delta["still_failed"] = sorted(baseline_failed & candidate_failed)
 
+        metrics: Dict[str, Any] | None = None
+        if include_metrics:
+            metrics = {
+                "baseline_ms": baseline_duration_ms,
+                "candidate_ms": candidate_duration_ms,
+                "total_ms": int((time.perf_counter() - check_started) * 1000),
+                "symbol_count": max(len(baseline_symbols), len(candidate_symbols)),
+                "active_bundle_count": len(active_bundles),
+                "active_rule_count": len(active_rules),
+                "candidate_rule_count": len(candidate_rules),
+                "active_expectation_count": len(active_expectations),
+                "fact_count": len(effective_facts),
+                "patch_add_count": len(patch_add),
+                "patch_replace_count": len(patch_replace),
+                "patch_delete_count": len(patch_delete),
+                "assumption_count": len(normalized_assumptions),
+            }
+
         return {
             "ok": True,
             "result": {
@@ -2358,6 +2961,7 @@ class LogicEngine:
                 "influence": influence_info,
                 "delta": delta,
                 "expectations": expectation_section,
+                "metrics": metrics,
             },
         }
 
@@ -2411,8 +3015,6 @@ CONTEXT_PATCH_OPS = [
     "remove_concept",
     "set_code_binding",
     "remove_code_binding",
-    "set_rule_meta",
-    "set_expectation_meta",
 ]
 PLAYBOOK_FOCUS_VALUES = ["onboarding", "discovery", "experiment", "hygiene", "handoff"]
 
@@ -2441,6 +3043,11 @@ def _tool_response_schema(result_schema: dict[str, Any] | None = None) -> dict[s
                 },
                 "required": ["code", "message"],
                 "additionalProperties": True,
+            },
+            "warnings": {
+                "type": "array",
+                "description": "Non-fatal normalization/advisory warnings emitted on successful calls.",
+                "items": {"type": "object", "additionalProperties": True},
             },
         },
         "required": ["ok"],
@@ -2523,8 +3130,9 @@ def _session_snapshot_markdown(session_id: str) -> str:
         "1. `logic_list` with `detail_level:\"minimal\"` and narrow `show` filters.",
         "2. Inspect one item deeply with `logic_read` when needed.",
         "3. Add or update one rule/expectation/context item at a time.",
-        "4. Run `logic_check` with a temporary `hypothesis.patch` for experiments.",
-        "5. Escalate list detail to `more` and use `logic_read` for full item detail.",
+        "4. Run `logic_check` using `hypothesis.assumptions` or `hypothesis.patch` for experiments.",
+        "5. Keep checks lightweight: start compact, keep `model_scope:\"facts\"`, include metrics.",
+        "6. Use `logic_reset` when changing problem contexts to avoid stale coupling.",
     ]
     return "\n".join(lines)
 
@@ -2580,20 +3188,22 @@ def _playbook_markdown(session_id: str, focus: str) -> str:
         "discovery": [
             "1. Convert each newly discovered requirement into one small `logic_set_rule` call.",
             "2. When omission risk appears, add one `logic_set_expectation` immediately.",
-            "3. Add code/concept anchors as soon as they are known via `logic_context_patch`.",
+            "3. Add code/concept links as soon as they are known via `logic_context_patch`.",
             "4. Re-run `logic_check` after each modest change instead of batching large edits.",
         ],
         "experiment": [
             "1. Keep persistent state stable; use `logic_check.hypothesis.patch` for trial ideas.",
-            "2. Try one patch at a time and inspect `breaks`, `delta`, `expectation_failures`.",
-            "3. Start with `detail_level:\"compact\"`; escalate to `more` and use `logic_read` for full item detail.",
-            "4. Persist only the experiments that survived checks.",
+            "2. Use `hypothesis.assumptions` for fast parametric trials without temp rule IDs.",
+            "3. Start with `detail_level:\"compact\"`, `model_scope:\"facts\"`, and metrics enabled.",
+            "4. Escalate detail/model scope only when compact evidence is insufficient.",
+            "5. Persist only the experiments that survived checks.",
         ],
         "hygiene": [
             "1. Before remove/replace, inspect dependencies with `logic_list`.",
             "2. Remove fragile links in safe order: expectations/context first, then rule/bundle.",
             "3. Keep context graph coherent by updating concepts and code bindings together.",
             "4. Prefer many reversible edits over one large destructive migration.",
+            "5. For full cleanup between tasks, run one `logic_reset` call.",
         ],
         "handoff": [
             "1. Export focused inventories (`rules`,`expectations`,`concepts`,`code_bindings`).",
@@ -2625,6 +3235,21 @@ def _base_tool_result_meta() -> dict[str, Any]:
 
 
 def _logic_tools() -> list[types.Tool]:
+    motivation_schema: dict[str, Any] = {
+        "type": "object",
+        "description": "Required motivation metadata. rationale is required; motivatedByItem is optional.",
+        "properties": {
+            "rationale": {"type": "string", "minLength": 1},
+            "motivatedByItem": {
+                "oneOf": [
+                    {"type": "string", "minLength": 1},
+                    {"type": "null"},
+                ]
+            },
+        },
+        "required": ["rationale"],
+        "additionalProperties": False,
+    }
     rule_content_schema = {
         "description": "Rule/bundle content. For pyexpr use a single expression string. For smt2 use one string or a command array.",
         "oneOf": [
@@ -2656,6 +3281,88 @@ def _logic_tools() -> list[types.Tool]:
         "required": ["lang", "rule"],
         "additionalProperties": False,
     }
+    line_location_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "line": {"type": "integer", "minimum": 1},
+            "col": {"type": "integer", "minimum": 1},
+        },
+        "required": ["line"],
+        "additionalProperties": False,
+    }
+    concept_patch_set_schema: dict[str, Any] = {
+        "type": "object",
+        "description": "Partial concept payload. On first insert, required concept fields must be provided.",
+        "properties": {
+            "concept": {"type": "string", "minLength": 1},
+            "meaning": {"type": "string", "minLength": 1},
+            "primary_symbols": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "related_rule_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "related_expectation_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "related_code_binding_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "motivation": motivation_schema,
+        },
+        "additionalProperties": False,
+    }
+    code_binding_patch_set_schema: dict[str, Any] = {
+        "type": "object",
+        "description": "Partial code-binding payload. On first insert, required binding fields must be provided.",
+        "properties": {
+            "kind": {"type": "string", "enum": ["source", "document"]},
+            "path": {"type": "string", "minLength": 1},
+            "from": line_location_schema,
+            "to": line_location_schema,
+            "line_excerpt": {"type": "string"},
+            "related_rule_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "related_expectation_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "related_concept_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "symbols_used": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "motivation": motivation_schema,
+        },
+        "additionalProperties": False,
+    }
+    context_patch_op_schema: dict[str, Any] = {
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "const": "set_concept"},
+                    "id": {"type": "string", "minLength": 1},
+                    "set": concept_patch_set_schema,
+                },
+                "required": ["op", "id", "set"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "const": "remove_concept"},
+                    "id": {"type": "string", "minLength": 1},
+                },
+                "required": ["op", "id"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "const": "set_code_binding"},
+                    "id": {"type": "string", "minLength": 1},
+                    "set": code_binding_patch_set_schema,
+                },
+                "required": ["op", "id", "set"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "const": "remove_code_binding"},
+                    "id": {"type": "string", "minLength": 1},
+                },
+                "required": ["op", "id"],
+                "additionalProperties": False,
+            },
+        ]
+    }
     list_result_schema = {
         "type": "object",
         "properties": {
@@ -2686,7 +3393,7 @@ def _logic_tools() -> list[types.Tool]:
     }
     check_result_schema = {
         "type": "object",
-        "description": "Baseline/candidate outcome and diagnostics shaped by detail_level.",
+        "description": "Baseline/candidate outcome and diagnostics shaped by detail_level and explicit flags.",
         "properties": {
             "baseline": {
                 "type": "object",
@@ -2715,8 +3422,19 @@ def _logic_tools() -> list[types.Tool]:
             "expectation_failures": {"type": "object", "additionalProperties": True},
             "expectations": {"type": "object", "additionalProperties": True},
             "influence": {"type": "object", "additionalProperties": True},
+            "metrics": {"type": "object", "additionalProperties": True},
         },
         "required": ["baseline", "candidate", "breaks"],
+        "additionalProperties": False,
+    }
+    reset_result_schema = {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string"},
+            "wiped_inventory": {"type": "boolean"},
+            "wiped_logs": {"type": "boolean"},
+        },
+        "required": ["session_id", "wiped_inventory", "wiped_logs"],
         "additionalProperties": False,
     }
 
@@ -2784,8 +3502,14 @@ def _logic_tools() -> list[types.Tool]:
                 "examples": ["pyexpr"],
             },
             "rule": rule_content_schema,
+            "intent": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Required top-level intent for the rule.",
+            },
+            "motivation": motivation_schema,
         },
-        required=["id", "lang", "rule"],
+        required=["id", "lang", "rule", "intent", "motivation"],
         read_only=False,
         destructive=False,
         idempotent=False,
@@ -2832,8 +3556,9 @@ def _logic_tools() -> list[types.Tool]:
                 **rule_content_schema,
                 "description": "SMT2 bundle content (declarations/defines/asserts).",
             },
+            "motivation": motivation_schema,
         },
-        required=["id", "bundle"],
+        required=["id", "bundle", "motivation"],
         read_only=False,
         destructive=False,
         idempotent=False,
@@ -2878,8 +3603,9 @@ def _logic_tools() -> list[types.Tool]:
             },
             "a_ref": {"type": "string", "minLength": 1, "description": "Left-side rule ID (A)."},
             "b_ref": {"type": "string", "minLength": 1, "description": "Right-side rule ID (B)."},
+            "motivation": motivation_schema,
         },
-        required=["id", "kind", "a_ref", "b_ref"],
+        required=["id", "kind", "a_ref", "b_ref", "motivation"],
         read_only=False,
         destructive=False,
         idempotent=False,
@@ -2905,11 +3631,41 @@ def _logic_tools() -> list[types.Tool]:
         meta={"use_cases": ["expectation_cleanup"]},
     )
     add_tool(
+        name="logic_reset",
+        title="Reset Session",
+        description=(
+            "Wipe the current session inventory with one lightweight call. "
+            "Use when switching tasks/models to avoid stale coupling."
+        ),
+        properties={
+            "confirm": {
+                "type": "string",
+                "const": "reset-session",
+                "description": "Safety confirmation token. Must be exactly reset-session.",
+            },
+            "wipe_logs": {
+                "type": "boolean",
+                "default": True,
+                "description": "Also delete this session's audit log file when true.",
+            },
+        },
+        required=["confirm"],
+        read_only=False,
+        destructive=True,
+        idempotent=True,
+        open_world=False,
+        output_schema=_tool_response_schema(reset_result_schema),
+        meta={
+            "use_cases": ["model_hygiene", "session_reuse"],
+            "workflow_hint": "Prefer one dedicated reset call instead of many remove_* calls.",
+        },
+    )
+    add_tool(
         name="logic_check",
         title="Check Hypothesis",
         description=(
-            "Run baseline vs candidate what-if analysis. Prefer many small experiments using hypothesis.patch "
-            "instead of one large speculative rewrite."
+            "Run lightweight baseline vs candidate what-if analysis. Prefer many small experiments using "
+            "hypothesis.assumptions for parameter sweeps and hypothesis.patch for structural trial changes."
         ),
         properties={
             "hypothesis": {
@@ -2924,10 +3680,25 @@ def _logic_tools() -> list[types.Tool]:
                         "additionalProperties": {
                             "oneOf": [
                                 {"type": "boolean"},
-                                {"type": "integer"},
                                 {"type": "number"},
                                 {"type": "string"},
                             ]
+                        },
+                    },
+                    "assumptions": {
+                        "type": "array",
+                        "description": (
+                            "Temporary assertions applied to both baseline and candidate without creating persistent rule IDs."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "lang": {"type": "string", "enum": RULE_LANG_VALUES},
+                                "rule": rule_content_schema,
+                            },
+                            "required": ["lang", "rule"],
+                            "additionalProperties": False,
                         },
                     },
                     "patch": {
@@ -2956,6 +3727,24 @@ def _logic_tools() -> list[types.Tool]:
                 "default": "compact",
                 "description": "Result verbosity/cost. Start compact, escalate only when needed.",
             },
+            "return_model": {
+                "type": "boolean",
+                "description": "Return one witness model when status is sat.",
+            },
+            "model_scope": {
+                "type": "string",
+                "enum": MODEL_SCOPE_VALUES,
+                "description": "Model payload scope: none|facts|all|selected.",
+            },
+            "model_symbols": {
+                "type": "array",
+                "description": "Used when model_scope=selected.",
+                "items": {"type": "string"},
+            },
+            "include_metrics": {
+                "type": "boolean",
+                "description": "Include lightweight solver/runtime metrics in result.metrics.",
+            },
         },
         required=[],
         read_only=True,
@@ -2965,38 +3754,23 @@ def _logic_tools() -> list[types.Tool]:
         output_schema=_tool_response_schema(check_result_schema),
         meta={
             "use_cases": ["what_if_analysis", "counterexample_search", "regression_risk_scan"],
-            "workflow_hint": "Use patch for experiments; persist only successful ideas.",
+            "workflow_hint": (
+                "Start compact with model_scope=facts and metrics=true; use assumptions for fast trials and patch for structural edits."
+            ),
         },
     )
     add_tool(
         name="logic_context_patch",
         title="Patch Context Graph",
         description=(
-            "Apply atomic updates to concepts, code bindings, and metadata. Keep logic-to-code links current as "
+            "Apply atomic updates to concepts and code bindings. Keep logic-to-code links current as "
             "new understanding appears."
         ),
         properties={
             "ops": {
                 "type": "array",
                 "description": "Atomic operation list applied in order.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "op": {
-                            "type": "string",
-                            "enum": CONTEXT_PATCH_OPS,
-                            "description": "Patch operation type.",
-                        },
-                        "id": {"type": "string", "minLength": 1, "description": "Target ID for this operation."},
-                        "set": {
-                            "type": "object",
-                            "description": "Partial payload for set_* operations. Ignored for remove_*.",
-                            "additionalProperties": True,
-                        },
-                    },
-                    "required": ["op", "id"],
-                    "additionalProperties": False,
-                },
+                "items": context_patch_op_schema,
                 "minItems": 1,
             }
         },
@@ -3077,7 +3851,7 @@ def _logic_tools() -> list[types.Tool]:
         open_world=False,
         output_schema=_tool_response_schema(read_result_schema),
         meta={
-            "use_cases": ["single_item_lookup", "deep_inspection", "handoff_anchor_review"],
+            "use_cases": ["single_item_lookup", "deep_inspection", "handoff_reference_review"],
             "workflow_hint": "Use after logic_list identifies the target ID.",
         },
     )
@@ -3236,9 +4010,11 @@ async def read_resource(uri: Any) -> Iterable[ReadResourceContents]:
                     "1. Orient with `logic_list` before mutations unless certainty is high.",
                     "2. Use `logic_read` for deep inspection of specific IDs.",
                     "3. Add structure incrementally: bundles/rules/expectations/context as discoveries appear.",
-                    "4. Use temporary `logic_check.hypothesis.patch` for experiments.",
-                    "5. Prefer many modest calls over one large speculative construction.",
-                    "6. Persist only the pieces that survive checks.",
+                    "4. Use `logic_check.hypothesis.assumptions` for fast parametric trials.",
+                    "5. Use `logic_check.hypothesis.patch` for temporary candidate rule overlays.",
+                    "6. Keep checks lightweight: compact detail, facts-scoped model, metrics on.",
+                    "7. Persist only the pieces that survive checks.",
+                    "8. Use `logic_reset` when switching to a different problem context.",
                     "",
                     "## Why This Pattern",
                     "- Faster: each call has lower cognitive and token cost.",
@@ -3264,8 +4040,9 @@ async def read_resource(uri: Any) -> Iterable[ReadResourceContents]:
                     "",
                     "## Experiment Freely",
                     "- Keep persistent graph stable.",
-                    "- Use `logic_check` with hypothesis facts/patch for trial ideas.",
-                    "- Compare compact outputs quickly; escalate list detail to `more` and inspect IDs with `logic_read` when needed.",
+                    "- Use `logic_check` with hypothesis facts/assumptions/patch for trial ideas.",
+                    "- Compare compact outputs quickly; escalate detail/model scope only when needed.",
+                    "- Use `logic_reset` for clean pivots between unrelated models.",
                     "",
                     "## Suggested Loop",
                     "1. list -> 2. read target IDs -> 3. one focused change -> 4. check -> 5. keep/revert idea -> 6. repeat",
@@ -3359,7 +4136,7 @@ PROMPTS: dict[str, types.Prompt] = {
         ),
         arguments=[
             types.PromptArgument(name="discovery", description="Natural-language discovery to encode.", required=True),
-            types.PromptArgument(name="code_path", description="Optional related source/doc path.", required=False),
+            types.PromptArgument(name="code_binding_id", description="Optional related code binding ID.", required=False),
             types.PromptArgument(name="symbols", description="Optional comma-separated symbols.", required=False),
         ],
     ),
@@ -3406,7 +4183,8 @@ def _prompt_text(name: str, arguments: dict[str, str]) -> tuple[str, str]:
                 "1. `logic_list` with `{show:[\"all\"], detail_level:\"minimal\"}`.",
                 "2. Retrieve exact items with `logic_read {\"id\":\"...\"}` before edits.",
                 "3. Make one focused mutation at a time.",
-                "4. Validate each mutation via `logic_check` (compact first).",
+                "4. Validate each mutation via `logic_check` (compact first, metrics on).",
+                "5. Use `logic_reset` if the session contains unrelated model residue.",
                 "",
                 "Default bias: look before act unless you are certain state already matches your intent.",
             ]
@@ -3414,7 +4192,7 @@ def _prompt_text(name: str, arguments: dict[str, str]) -> tuple[str, str]:
         return ("Orientation workflow before edits.", text)
     if name == "logic_capture_discovery":
         discovery = arguments.get("discovery", "(no discovery text provided)")
-        code_path = arguments.get("code_path", "")
+        code_binding_id = arguments.get("code_binding_id", "")
         symbols = arguments.get("symbols", "")
         lines = [
             f"Discovery: {discovery}",
@@ -3427,8 +4205,10 @@ def _prompt_text(name: str, arguments: dict[str, str]) -> tuple[str, str]:
         ]
         if symbols:
             lines.append(f"- Candidate symbols: {symbols}")
-        if code_path:
-            lines.append(f"- Add/patch code binding path: {code_path}")
+        if code_binding_id:
+            lines.append(f"- Link/patch related code binding id: {code_binding_id}")
+        else:
+            lines.append("- If code reference is needed, create/update a `code_binding` via `logic_context_patch`.")
         lines.extend(
             [
                 "",
@@ -3448,12 +4228,13 @@ def _prompt_text(name: str, arguments: dict[str, str]) -> tuple[str, str]:
                 "",
                 "Experiment loop:",
                 "1. Keep persistent state stable.",
-                "2. Use `logic_check.hypothesis.patch` with one temporary change.",
-                "3. Inspect `breaks`, `delta`, and `expectation_failures`.",
-                "4. Keep, refine, or discard the idea.",
-                "5. Repeat with next small variation.",
+                "2. Use `logic_check.hypothesis.assumptions` for quick threshold sweeps.",
+                "3. Use `logic_check.hypothesis.patch` with one temporary structural change.",
+                "4. Inspect `breaks`, `delta`, `expectation_failures`, and `metrics`.",
+                "5. Keep, refine, or discard the idea.",
+                "6. Repeat with next small variation.",
                 "",
-                "Escalate to `more` first; use `logic_read` for full item detail when compact output is insufficient.",
+                "Escalate to `more` first; widen `model_scope` only when facts-scoped witness is insufficient.",
             ]
         )
         return ("What-if loop for safe, cheap, exact experimentation.", text)
@@ -3465,7 +4246,7 @@ def _prompt_text(name: str, arguments: dict[str, str]) -> tuple[str, str]:
             "Collect these views:",
             "1. `logic_list` for `rules` and `expectations` (more).",
             "2. `logic_list` for `concepts` and `code_bindings` (more).",
-            "3. Specific `logic_read {\"id\":\"...\", \"detail_level\":\"full\"}` lookups for critical anchors.",
+            "3. Specific `logic_read {\"id\":\"...\", \"detail_level\":\"full\"}` lookups for critical references.",
             "4. One representative `logic_check` result for active risk context.",
         ]
         if risk_area:
@@ -3607,6 +4388,7 @@ async def call_tool(name: str, arguments: dict | None) -> dict:
         "logic_remove_bundle": engine.remove_bundle,
         "logic_set_expectation": engine.set_expectation,
         "logic_remove_expectation": engine.remove_expectation,
+        "logic_reset": engine.reset_session,
         "logic_context_patch": engine.context_patch,
         "logic_list": engine.list_items,
         "logic_read": engine.read_item,
@@ -3619,6 +4401,7 @@ async def call_tool(name: str, arguments: dict | None) -> dict:
         "logic_remove_bundle",
         "logic_set_expectation",
         "logic_remove_expectation",
+        "logic_reset",
         "logic_context_patch",
     }
     response: dict

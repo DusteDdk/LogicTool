@@ -20,6 +20,7 @@ from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
+from .errors import LogicError
 from .paths import PROJECT_ROOT
 from .store import sanitize_namespace
 from .supervisor import INTERCEPT_MODES
@@ -29,6 +30,9 @@ from .supervisor import read_recent_logs
 
 SUPERVISOR_ASSETS_DIR = PROJECT_ROOT / "logic_mcp" / "resources" / "supervisor"
 BOOTSTRAP_DIR = PROJECT_ROOT / "logic_mcp" / "resources" / "bootstrap"
+SIDECAR_ARTIFACT_DIR = PROJECT_ROOT / "LogiCar"
+SIDECAR_ALLOWED_COMMANDS = {"set_session", "add_tool", "list_tools", "remove_tool", "write_bootstrap"}
+SIDECAR_ALLOWED_CLIENTS = {"codex", "claude"}
 LOG_LEVELS = {"debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"}
 LOG_WINDOW_SIZE = 10
 
@@ -181,6 +185,97 @@ def create_http_app(server: Any) -> Starlette:
             }
         )
 
+    async def api_remove_session(request: Request) -> JSONResponse:
+        session_id = sanitize_namespace(request.path_params["session_id"])
+        removed, reason = await SUPERVISOR.delete_session_data(session_id)
+        if removed:
+            return JSONResponse({"ok": True, "deleted": True, "session_id": session_id})
+        if reason == "session_not_found":
+            return JSONResponse({"ok": False, "error": reason, "session_id": session_id}, status_code=404)
+        return JSONResponse({"ok": False, "error": reason, "session_id": session_id}, status_code=500)
+
+    async def api_reset_session(request: Request) -> JSONResponse:
+        session_id = sanitize_namespace(request.path_params["session_id"])
+        body = await _read_json_body(request)
+        wipe_logs = body.get("wipe_logs", True)
+        if not isinstance(wipe_logs, bool):
+            return JSONResponse({"ok": False, "error": "wipe_logs_must_be_boolean"}, status_code=400)
+        try:
+            from .engine import get_engine
+
+            response = get_engine(session_id).reset_session({"confirm": "reset-session", "wipe_logs": wipe_logs})
+            await SUPERVISOR.publish_session_graph_updated(session_id)
+            payload = response.get("result", {}) if isinstance(response, dict) else {}
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "session_id": session_id,
+                    "wiped_inventory": bool(payload.get("wiped_inventory")),
+                    "wiped_logs": bool(payload.get("wiped_logs")),
+                }
+            )
+        except LogicError as exc:
+            status = 404 if exc.code == "E_UNKNOWN_ID" else 400
+            return JSONResponse(
+                {"ok": False, "error": exc.code, "message": exc.message, "details": exc.details},
+                status_code=status,
+            )
+        except Exception:
+            return JSONResponse({"ok": False, "error": "session_reset_failed"}, status_code=500)
+
+    async def api_sidecars(_: Request) -> JSONResponse:
+        sidecars = await SUPERVISOR.list_sidecars_summary()
+        return JSONResponse({"ok": True, "sidecars": sidecars})
+
+    async def api_sidecar_command(request: Request) -> JSONResponse:
+        instance_id = request.path_params["instance_id"]
+        body = await _read_json_body(request)
+        command = body.get("command")
+        if not isinstance(command, str) or command not in SIDECAR_ALLOWED_COMMANDS:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "invalid_command",
+                    "valid_commands": sorted(SIDECAR_ALLOWED_COMMANDS),
+                },
+                status_code=400,
+            )
+        args = body.get("args")
+        payload_args = args if isinstance(args, dict) else {}
+        if command in {"add_tool", "list_tools", "remove_tool"}:
+            client = payload_args.get("client")
+            if not isinstance(client, str) or client not in SIDECAR_ALLOWED_CLIENTS:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": "invalid_client",
+                        "valid_clients": sorted(SIDECAR_ALLOWED_CLIENTS),
+                    },
+                    status_code=400,
+                )
+        if command == "set_session":
+            session = payload_args.get("session")
+            if session is not None and not isinstance(session, str):
+                return JSONResponse({"ok": False, "error": "session_must_be_string"}, status_code=400)
+            payload_args = {"session": session if isinstance(session, str) else ""}
+
+        ok, reason, result = await SUPERVISOR.send_command_to_sidecar(
+            instance_id,
+            command=command,
+            arguments=payload_args,
+        )
+        if not ok:
+            if reason == "sidecar_not_found":
+                return JSONResponse({"ok": False, "error": reason}, status_code=404)
+            if reason == "sidecar_offline":
+                return JSONResponse({"ok": False, "error": reason}, status_code=409)
+            if reason == "sidecar_command_timeout":
+                return JSONResponse({"ok": False, "error": reason}, status_code=504)
+            if reason == "sidecar_command_invalid":
+                return JSONResponse({"ok": False, "error": reason}, status_code=400)
+            return JSONResponse({"ok": False, "error": reason}, status_code=500)
+        return JSONResponse({"ok": True, "instance_id": instance_id, "result": result or {}})
+
     async def supervisor_ws(websocket: WebSocket) -> None:
         await websocket.accept()
         queue = await SUPERVISOR.subscribe()
@@ -203,6 +298,60 @@ def create_http_app(server: Any) -> Starlette:
         finally:
             await SUPERVISOR.unsubscribe(queue)
 
+    async def sidecar_ws(websocket: WebSocket) -> None:
+        await websocket.accept()
+        instance_id = ""
+        try:
+            hello = await asyncio.wait_for(websocket.receive_json(), timeout=15.0)
+            if not isinstance(hello, dict) or hello.get("type") != "hello":
+                await websocket.close(code=4400)
+                return
+            registration = await SUPERVISOR.register_sidecar_connection(
+                instance_id=str(hello.get("instance_id") or ""),
+                connection=websocket,
+                workdir=hello.get("workdir"),
+                local=hello.get("local"),
+                session_id=hello.get("session"),
+                pid=hello.get("pid"),
+                remote=hello.get("remote"),
+                tool_url=hello.get("tool_url"),
+            )
+            instance_id = str(registration.get("instance_id") or "")
+            await websocket.send_json({"type": "hello_ack", "instance_id": instance_id})
+            while True:
+                payload = await websocket.receive_json()
+                if not isinstance(payload, dict):
+                    continue
+                msg_type = payload.get("type")
+                if msg_type in {"heartbeat", "status", "hello"}:
+                    await SUPERVISOR.update_sidecar_connection(
+                        instance_id,
+                        workdir=payload.get("workdir"),
+                        local=payload.get("local"),
+                        session_id=payload.get("session"),
+                        pid=payload.get("pid"),
+                        remote=payload.get("remote"),
+                        tool_url=payload.get("tool_url"),
+                    )
+                    if msg_type == "hello":
+                        await websocket.send_json({"type": "hello_ack", "instance_id": instance_id})
+                    continue
+                if msg_type == "command_result":
+                    command_id = payload.get("command_id")
+                    if isinstance(command_id, str) and command_id:
+                        await SUPERVISOR.resolve_sidecar_command(instance_id, command_id, payload)
+                    continue
+                if msg_type == "ping":
+                    await websocket.send_json({"type": "pong"})
+                    continue
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            if instance_id:
+                await SUPERVISOR.mark_sidecar_disconnected(instance_id)
+
     async def agents_bootstrap(request: Request) -> JSONResponse:
         files = bootstrap_resource_files(BOOTSTRAP_DIR)
         base_url = _bootstrap_base_url_from_request(request)
@@ -223,6 +372,24 @@ def create_http_app(server: Any) -> Starlette:
             return JSONResponse({"ok": False, "error": "bootstrap_resource_not_found"}, status_code=404)
         return FileResponse(target)
 
+    async def agents_sidecar_bootstrap(request: Request) -> JSONResponse:
+        files = bootstrap_resource_files(SIDECAR_ARTIFACT_DIR)
+        base_url = _bootstrap_base_url_from_request(request)
+        urls = [f"{base_url}/agents/bootstrap/sidecar/{name}" for name in files]
+        payload = {
+            "instruction": "Download the LogiCar sidecar artifact and run it in the client project environment.",
+            "download_strategy": "Download from artifact_urls and execute the artifact file directly.",
+            "artifact_urls": urls,
+        }
+        return JSONResponse(payload)
+
+    async def agents_sidecar_resource(request: Request) -> FileResponse:
+        filename = request.path_params["filename"]
+        target = (SIDECAR_ARTIFACT_DIR / filename).resolve()
+        if SIDECAR_ARTIFACT_DIR.resolve() not in target.parents or not target.is_file():
+            return JSONResponse({"ok": False, "error": "sidecar_resource_not_found"}, status_code=404)
+        return FileResponse(target)
+
     return Starlette(
         routes=[
             Route("/healthz", endpoint=healthz, methods=["GET"]),
@@ -235,15 +402,22 @@ def create_http_app(server: Any) -> Starlette:
             Route("/supervisor/api/intercepts/{intercept_id:str}/override", endpoint=api_intercept_override, methods=["POST"]),
             Route("/supervisor/api/intercepts/{intercept_id:str}/send", endpoint=api_intercept_send, methods=["POST"]),
             Route("/supervisor/api/sessions/{session_id:str}/messages", endpoint=api_send_session_message, methods=["POST"]),
+            Route("/supervisor/api/sessions/{session_id:str}/reset", endpoint=api_reset_session, methods=["POST"]),
+            Route("/supervisor/api/sessions/{session_id:str}", endpoint=api_remove_session, methods=["DELETE"]),
+            Route("/supervisor/api/sidecars", endpoint=api_sidecars, methods=["GET"]),
+            Route("/supervisor/api/sidecars/{instance_id:str}/command", endpoint=api_sidecar_command, methods=["POST"]),
             Route("/agents/bootstrap", endpoint=agents_bootstrap, methods=["GET"]),
             Route(
                 "/agents/bootstrap/resources/{filename:path}",
                 endpoint=agents_bootstrap_resource,
                 methods=["GET"],
             ),
+            Route("/agents/bootstrap/sidecar/", endpoint=agents_sidecar_bootstrap, methods=["GET"]),
+            Route("/agents/bootstrap/sidecar/{filename:path}", endpoint=agents_sidecar_resource, methods=["GET"]),
             Route("/sessions/{session_id:str}", endpoint=streamable_http_app),
             Route("/sessions/{session_id:str}/", endpoint=streamable_http_app),
             WebSocketRoute("/supervisor/ws", endpoint=supervisor_ws),
+            WebSocketRoute("/supervisor/sidecar/ws", endpoint=sidecar_ws),
         ],
         lifespan=lifespan,
     )
@@ -258,6 +432,7 @@ async def _read_json_body(request: Request) -> dict[str, Any]:
 
 
 async def _build_ws_snapshot() -> dict[str, Any]:
+    sidecars = await SUPERVISOR.list_sidecars_summary()
     sessions = await SUPERVISOR.list_sessions_summary()
     logs_by_session: dict[str, list[dict[str, Any]]] = {}
     session_ids: list[str] = []
@@ -267,7 +442,12 @@ async def _build_ws_snapshot() -> dict[str, Any]:
             session_ids.append(session_id)
             logs_by_session[session_id] = read_recent_logs(session_id, limit=LOG_WINDOW_SIZE)
     graphs_by_session = await SUPERVISOR.get_graphs_by_session(session_ids)
-    return {"sessions": sessions, "logs_by_session": logs_by_session, "graphs_by_session": graphs_by_session}
+    return {
+        "sidecars": sidecars,
+        "sessions": sessions,
+        "logs_by_session": logs_by_session,
+        "graphs_by_session": graphs_by_session,
+    }
 
 
 def _bootstrap_base_url_from_request(request: Request) -> str:

@@ -17,7 +17,17 @@ class SessionGraphRenderTests(unittest.TestCase):
 
     def test_render_table_lists_relations_and_incoming_count(self) -> None:
         nodes = [
-            GraphNode(node_id="r_a", node_type="rule", label="r_a", details=["type: rule"]),
+            GraphNode(
+                node_id="r_a",
+                node_type="rule",
+                label="r_a",
+                details=["type: rule"],
+                version=2,
+                created_at=1771100000.0,
+                content_lang="pyexpr",
+                content_value="x > 0",
+                content_bytes=7,
+            ),
             GraphNode(node_id="b_a", node_type="bundle", label="b_a", details=["type: bundle"]),
             GraphNode(node_id="c_a", node_type="concept", label="c_a", details=["type: concept"]),
         ]
@@ -35,9 +45,17 @@ class SessionGraphRenderTests(unittest.TestCase):
         self.assertEqual(by_id["b_a"].get("incoming_relations_count"), 1)
         self.assertEqual(by_id["c_a"].get("incoming_relations_count"), 0)
         self.assertEqual(
+            by_id["r_a"].get("incoming_relations"),
+            [{"label": "related_rule", "source_id": "c_a"}],
+        )
+        self.assertEqual(
             by_id["r_a"].get("outgoing_relations"),
             [{"label": "uses_bundle", "target_id": "b_a"}],
         )
+        self.assertEqual(by_id["r_a"].get("version"), 2)
+        self.assertEqual(by_id["r_a"].get("content_lang"), "pyexpr")
+        self.assertEqual(by_id["r_a"].get("content_value"), "x > 0")
+        self.assertEqual(by_id["r_a"].get("content_bytes"), 7)
 
 
 if __name__ == "__main__":

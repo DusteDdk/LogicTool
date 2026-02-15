@@ -12,14 +12,16 @@ Runtime code is split into focused modules:
 It supports:
 - Persistent `bundles` (SMT2 fragments), `rules` (`pyexpr` or `smt2`), and `expectations`
 - Persistent context inventory (`concepts`, `code_bindings`) via atomic `logic_context_patch`
-- What-if checks with temporary hypothesis facts and rule patch overlays (`set_rules`, `remove_rules`)
+- Required top-level `motivation` metadata for all non-symbol inserted items
+- What-if checks with temporary hypothesis facts, lightweight assumptions, and rule patch overlays (`set_rules`, `remove_rules`)
 - Baseline vs candidate evaluation with `sat` / `unsat` / `unknown`
-- Unsat cores, witness models, expectation checks, influence analysis, and delta reporting (by `detail_level`)
-- Strict SMT2 command acceptance (`declare-*`, `define-fun*`, `assert`)
+- Unsat cores, witness models (scope-controlled), expectation checks, influence analysis, metrics, and delta reporting (by `detail_level`)
+- Session reset via one lightweight call (`logic_reset`)
+- Strict SMT2 command acceptance (`declare-*`, `define-fun*`, `assert`, `set-logic`, `set-option`)
 
 Persistent state is stored in `logic_store/<sessionId>/session.json`.
 Session id is derived from the URL path segment in `/sessions/<sessionId>/` (and never from tool payload fields).
-Tool-call audit logs are written per session to `logic_store/<sessionId>_log.jsonl`.
+Tool-call audit logs are written per session to `logic_store/<sessionId>/log.jsonl`.
 Each line is a JSON object with shape:
 `{"time":"<timestamp>","call":<raw call JSON object>,"response":<raw response JSON object>}`.
 When raw call extraction fails and strict logging is enabled, `call` includes:
@@ -89,6 +91,12 @@ Optional environment overrides:
 - `AGENTS_FILE`: target `AGENTS.md` path (default: `$PROJECT_DIR/AGENTS.md`)
 - `SERVER_PATH`: override server script path
 
+## LogiCar sidecar
+- Sidecar source artifact: `LogiCar/logicar.py`
+- Sidecar command websocket endpoint: `ws://<host>:<port>/supervisor/sidecar/ws`
+- Download artifact list: `http://<host>:<port>/agents/bootstrap/sidecar/`
+- Download artifact file: `http://<host>:<port>/agents/bootstrap/sidecar/logicar.py`
+
 ## Validation Scripts
 - `scripts/integration_test_http.sh`: MCP initialize/call flow, session isolation, list/read behavior, and log fidelity.
 - `scripts/test_audit_parse_error.sh`: strict parse-error logging behavior and JSONL-safe escaped raw body.
@@ -103,13 +111,14 @@ Files expected at project root after install:
 - `AGENTS.md` (contains the Logic MCP snippet)
 
 ## Tools exposed
-The server exposes 10 tools:
+The server exposes 11 tools:
 - `logic_set_rule`
 - `logic_remove_rule`
 - `logic_set_bundle`
 - `logic_remove_bundle`
 - `logic_set_expectation`
 - `logic_remove_expectation`
+- `logic_reset`
 - `logic_check`
 - `logic_context_patch`
 - `logic_list`
@@ -155,7 +164,10 @@ MCP already carries tool name, so the simplest payloads do not need a `tool` fie
   "bundle": [
     "(declare-const start_time_sim1_ms Int)",
     "(declare-const start_time_sim2_ms Int)"
-  ]
+  ],
+  "motivation": {
+    "rationale": "Shared declarations for simulation start-time rules"
+  }
 }
 ```
 
@@ -164,7 +176,11 @@ MCP already carries tool name, so the simplest payloads do not need a `tool` fie
 {
   "id": "sim_start_exact",
   "lang": "pyexpr",
-  "rule": "start_time_sim1_ms == start_time_sim2_ms"
+  "rule": "start_time_sim1_ms == start_time_sim2_ms",
+  "intent": "Express start-time equality invariant",
+  "motivation": {
+    "rationale": "Capture discovered invariant from requirements"
+  }
 }
 ```
 
@@ -174,7 +190,10 @@ MCP already carries tool name, so the simplest payloads do not need a `tool` fie
   "id": "exp_exact_implies_nonneg",
   "kind": "entails",
   "a_ref": "sim_start_exact",
-  "b_ref": "sim_start_exact"
+  "b_ref": "sim_start_exact",
+  "motivation": {
+    "rationale": "Guard against refactor drift in expectation links"
+  }
 }
 ```
 
@@ -186,6 +205,13 @@ MCP already carries tool name, so the simplest payloads do not need a `tool` fie
       "start_time_sim1_ms": 0,
       "start_time_sim2_ms": "?t2"
     },
+    "assumptions": [
+      {
+        "id": "a_threshold",
+        "lang": "pyexpr",
+        "rule": "start_time_sim2_ms >= start_time_sim1_ms"
+      }
+    ],
     "patch": {
       "set_rules": {
         "sim1_first": {
@@ -196,7 +222,18 @@ MCP already carries tool name, so the simplest payloads do not need a `tool` fie
       "remove_rules": []
     }
   },
-  "detail_level": "compact"
+  "detail_level": "compact",
+  "return_model": true,
+  "model_scope": "facts",
+  "include_metrics": true
+}
+```
+
+### `logic_reset`
+```json
+{
+  "confirm": "reset-session",
+  "wipe_logs": true
 }
 ```
 
@@ -209,9 +246,15 @@ MCP already carries tool name, so the simplest payloads do not need a `tool` fie
       "id": "cb_pricing",
       "set": {
         "path": "src/pricing.py",
+        "from": {"line": 12},
+        "to": {"line": 26},
+        "line_excerpt": "compute_price(amount, tax_rate)",
         "related_rule_ids": ["sim_start_exact"],
         "related_expectation_ids": [],
-        "related_concept_ids": []
+        "related_concept_ids": [],
+        "motivation": {
+          "rationale": "Primary pricing implementation location for this rule"
+        }
       }
     }
   ]
@@ -244,7 +287,7 @@ Minimal single-ID lookup:
 
 ## Result format
 All tools return:
-- Success: `{ "ok": true }` or `{ "ok": true, "result": { ... } }`
+- Success: `{ "ok": true }` or `{ "ok": true, "result": { ... } }` (optionally with `warnings: [...]`)
 - Failure: `{ "ok": false, "error": { "code": "...", "message": "...", "details": { ... } } }`
 
 ## Quick workflow in Codex

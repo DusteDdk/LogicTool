@@ -9,7 +9,10 @@ alwaysApply: true
 - Prefer incremental model building: bundles, then rules, then expectations.
 - Keep IDs stable and descriptive (`b_*`, `r_*`, `e_*`, `c_*`, `cb_*`).
 - Use `logic_check` frequently as a what-if guard during refactors.
-- Favor temporary hypothesis patches for experiments over mutating baseline state.
+- Start lightweight: `detail_level:"compact"`, `model_scope:"facts"`, `include_metrics:true`.
+- Use `hypothesis.assumptions` for quick parameter sweeps.
+- Favor temporary `hypothesis.patch` edits for structural experiments over mutating baseline state.
+- Use `logic_reset` when switching to an unrelated model/problem.
 - Update concepts and code bindings whenever understanding changes.
 
 # Dependency Safety
@@ -21,6 +24,7 @@ alwaysApply: true
 # Refactor Guard Pattern
 
 1. Baseline `logic_check`.
-2. Candidate patch (`remove_rules` etc.).
-3. Inspect newly failed expectations and counterexamples.
-4. Decide whether to proceed, adjust logic, or back out.
+2. Parameter sweep via `hypothesis.assumptions` (optional).
+3. Candidate patch (`remove_rules` etc.).
+4. Inspect `delta`, `expectation_failures`, witness model, and metrics.
+5. Decide whether to proceed, adjust logic, or back out.

@@ -13,10 +13,10 @@ BASE_URL="http://127.0.0.1:${PORT}"
 
 SESSION_A="itest-a"
 SESSION_B="itest-b"
-LOG_A="$ROOT_DIR/logic_store/${SESSION_A}_log.jsonl"
-LOG_B="$ROOT_DIR/logic_store/${SESSION_B}_log.jsonl"
 STATE_A_DIR="$ROOT_DIR/logic_store/${SESSION_A}"
 STATE_B_DIR="$ROOT_DIR/logic_store/${SESSION_B}"
+LOG_A="$STATE_A_DIR/log.jsonl"
+LOG_B="$STATE_B_DIR/log.jsonl"
 
 rm -f "$LOG_A" "$LOG_B"
 rm -rf "$STATE_A_DIR" "$STATE_B_DIR"
@@ -82,9 +82,9 @@ MCP_A="$(init_session "$SESSION_A")"
 MCP_B="$(init_session "$SESSION_B")"
 
 call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"logic_list"}}' /tmp/itest_a_list.txt
-call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"logic_set_rule","arguments":{"id":"rule-a","lang":"pyexpr","rule":"x > 0"}}}' /tmp/itest_a_set_rule.txt
-call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"logic_set_expectation","arguments":{"id":"exp-a","kind":"entails","a_ref":"rule-a","b_ref":"rule-a"}}}' /tmp/itest_a_set_expect.txt
-call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"logic_context_patch","arguments":{"ops":[{"op":"set_code_binding","id":"cb-a","set":{"path":"src/a.py","related_rule_ids":["rule-a"],"related_expectation_ids":[],"related_concept_ids":[]}}]}}}' /tmp/itest_a_context_patch.txt
+call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"logic_set_rule","arguments":{"id":"rule-a","lang":"pyexpr","rule":"x > 0","intent":"Rule for integration test flow","motivation":{"rationale":"Seed a minimal rule for e2e assertions"}}}}' /tmp/itest_a_set_rule.txt
+call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"logic_set_expectation","arguments":{"id":"exp-a","kind":"entails","a_ref":"rule-a","b_ref":"rule-a","motivation":{"rationale":"Guard against accidental expectation shape regressions"}}}}' /tmp/itest_a_set_expect.txt
+call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"logic_context_patch","arguments":{"ops":[{"op":"set_code_binding","id":"cb-a","set":{"path":"src/a.py","related_rule_ids":["rule-a"],"related_expectation_ids":[],"related_concept_ids":[],"motivation":{"rationale":"Bind rule to concrete source path"}}}]}}}' /tmp/itest_a_context_patch.txt
 call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"logic_list","arguments":{"show":["all"],"detail_level":"more"}}}' /tmp/itest_a_list_more.txt
 call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"logic_read","arguments":{"id":"rule-a","detail_level":"full"}}}' /tmp/itest_a_read_rule.txt
 call_tool "$SESSION_A" "$MCP_A" '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"logic_list","arguments":{"detail_level":"full"}}}' /tmp/itest_a_list_full_rejected.txt
@@ -105,7 +105,9 @@ rg -q '"structuredContent":\{"ok":true,"result":\{"items":\[\]\}\}' /tmp/itest_b
 
 [[ -f "$LOG_A" ]] && [[ -f "$LOG_B" ]]
 head -n 1 "$LOG_A" | rg -q '"call":\{"name":"logic_list"\}'
-rg -q '"call":\{"name":"logic_set_rule","arguments":\{"id":"rule-a","lang":"pyexpr","rule":"x > 0"\}\}' "$LOG_A"
+rg -q '"call":\{"name":"logic_set_rule"' "$LOG_A"
+rg -q '"intent":"Rule for integration test flow"' "$LOG_A"
+rg -q '"motivation":\{"rationale":"Seed a minimal rule for e2e assertions"\}' "$LOG_A"
 ! rg -q 'logic_set_rule' "$LOG_B"
 
 echo "integration test passed"

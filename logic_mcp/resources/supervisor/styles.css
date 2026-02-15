@@ -25,6 +25,63 @@ h1 {
   font-size: 0.85rem;
 }
 
+h2 {
+  margin: 18px 0 8px;
+}
+
+.sidecar-card {
+  background: #ffffff;
+  border: 1px solid #d9e1e8;
+  border-radius: 8px;
+  margin-bottom: 12px;
+  padding: 12px;
+}
+
+.sidecar-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.sidecar-title {
+  font-weight: 700;
+}
+
+.sidecar-meta {
+  color: #334155;
+  font-size: 0.84rem;
+}
+
+.sidecar-details {
+  margin-bottom: 10px;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+.sidecar-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sidecar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.sidecar-row input {
+  min-width: 220px;
+}
+
+.sidecar-output {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+}
+
 .session-card {
   background: #ffffff;
   border: 1px solid #d9e1e8;
@@ -34,19 +91,21 @@ h1 {
 }
 
 .session-headline {
-  width: 100%;
-  border: 0;
-  background: #ffffff;
-  text-align: left;
   display: flex;
   justify-content: space-between;
   gap: 14px;
   padding: 14px;
+  background: #ffffff;
   cursor: pointer;
 }
 
 .session-headline:hover {
-  background: #f3f6f9;
+  background: #f8fafc;
+}
+
+.session-headline:focus {
+  outline: 2px solid #1f6feb;
+  outline-offset: -2px;
 }
 
 .session-name {
@@ -68,6 +127,12 @@ h1 {
 
 .session-body.open {
   display: block;
+}
+
+.session-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 10px;
 }
 
 .intercept-row {
@@ -98,6 +163,13 @@ h1 {
   width: 100%;
   box-sizing: border-box;
   padding: 8px 0;
+}
+
+.log-controls {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  padding: 0 10px 8px;
 }
 
 .graph-table-wrap {
@@ -144,9 +216,44 @@ h1 {
 }
 
 .graph-outgoing-cell {
-  white-space: pre;
-  overflow: hidden;
-  text-overflow: clip;
+  white-space: normal;
+}
+
+.graph-incoming-cell {
+  white-space: normal;
+}
+
+.graph-id-cell {
+  white-space: nowrap;
+}
+
+.graph-content-cell {
+  white-space: nowrap;
+}
+
+.graph-relation-line {
+  display: block;
+  line-height: 1.35;
+}
+
+.relation-open {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: #1f6feb;
+  text-decoration: underline;
+  text-align: left;
+}
+
+.relation-open:disabled {
+  color: #94a3b8;
+  text-decoration: none;
+}
+
+.content-open {
+  padding: 2px 8px;
+  border-color: #c4cfdb;
+  background: #fff;
 }
 
 .mono {
@@ -162,13 +269,71 @@ h1 {
   overflow: hidden;
 }
 
+.log-entry {
+  display: block;
+}
+
 .log-line {
   padding: 0 10px;
   white-space: pre;
+  word-break: normal;
+  overflow-wrap: normal;
   overflow: hidden;
   text-overflow: clip;
   line-height: 1.35;
   user-select: text;
+}
+
+.log-line-clickable {
+  cursor: pointer;
+}
+
+.log-line-clickable.open {
+  background: #eef4ff;
+}
+
+.log-details {
+  margin: 4px 10px 0;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.content-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 50;
+}
+
+.content-modal-overlay[hidden] {
+  display: none;
+}
+
+.content-modal {
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  width: min(780px, 100%);
+  max-height: 90vh;
+  overflow: auto;
+  padding: 12px;
+  box-sizing: border-box;
+}
+
+.content-modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.content-modal-meta,
+.content-modal-value {
+  margin: 0 0 10px;
 }
 
 pre {
@@ -213,6 +378,18 @@ button {
 button.primary {
   background: #1f6feb;
   border-color: #1f6feb;
+  color: #fff;
+}
+
+button.danger {
+  background: #b91c1c;
+  border-color: #b91c1c;
+  color: #fff;
+}
+
+button.warning {
+  background: #b45309;
+  border-color: #b45309;
   color: #fff;
 }
 

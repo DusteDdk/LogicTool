@@ -22,6 +22,7 @@ class LogicMcpSurfaceMetadataTests(unittest.TestCase):
         self.assertIn("logic_list", tools)
         self.assertIn("logic_read", tools)
         self.assertIn("logic_check", tools)
+        self.assertIn("logic_reset", tools)
         self.assertIn("logic_context_patch", tools)
 
         logic_list = tools["logic_list"]
@@ -41,6 +42,32 @@ class LogicMcpSurfaceMetadataTests(unittest.TestCase):
         logic_check = tools["logic_check"]
         self.assertIsNotNone(logic_check.outputSchema)
         self.assertIn("result", logic_check.outputSchema.get("properties", {}))
+        facts_schema = (
+            logic_check.inputSchema.get("properties", {})
+            .get("hypothesis", {})
+            .get("properties", {})
+            .get("facts", {})
+        )
+        fact_value_schema = facts_schema.get("additionalProperties", {})
+        self.assertIn("oneOf", fact_value_schema)
+        fact_types = {entry.get("type") for entry in fact_value_schema.get("oneOf", []) if isinstance(entry, dict)}
+        self.assertEqual(fact_types, {"boolean", "number", "string"})
+        self.assertNotIn("integer", fact_types)
+        check_props = logic_check.inputSchema.get("properties", {})
+        self.assertIn("return_model", check_props)
+        self.assertIn("model_scope", check_props)
+        self.assertIn("include_metrics", check_props)
+        assumption_schema = (
+            check_props.get("hypothesis", {})
+            .get("properties", {})
+            .get("assumptions", {})
+        )
+        self.assertEqual(assumption_schema.get("type"), "array")
+        self.assertIn("selected", check_props.get("model_scope", {}).get("enum", []))
+
+        logic_reset = tools["logic_reset"]
+        self.assertIsNotNone(logic_reset.outputSchema)
+        self.assertIn("confirm", logic_reset.inputSchema.get("properties", {}))
 
     def test_resources_and_templates_are_exposed(self) -> None:
         resources_result = asyncio.run(list_resources())
