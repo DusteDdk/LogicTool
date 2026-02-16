@@ -1494,7 +1494,6 @@ class LogicEngine:
             "bundles": {},
             "rules": {},
             "expectations": {},
-            "defaults": {},
             "context": {"concepts": {}, "code_bindings": {}},
         }
         self.store.save()
@@ -2376,21 +2375,6 @@ class LogicEngine:
     ) -> z3.BoolRef:
         return self._compile_rule_bundle(rule_entry["id"], rule_entry, z3_vars, symbol_table).full_expr
 
-    def _get_default_facts(self) -> Dict[str, Any]:
-        defaults = self.store.data.get("defaults", {})
-        if not isinstance(defaults, dict):
-            return {}
-        facts: Dict[str, Any] = {}
-        default_facts = defaults.get("facts")
-        if isinstance(default_facts, dict):
-            facts.update(default_facts)
-        for key, value in defaults.items():
-            if key in {"facts", "domains", "types", "preferred_types"}:
-                continue
-            if isinstance(value, (bool, int, float, str)):
-                facts.setdefault(key, value)
-        return facts
-
     def _check_expectations(
         self,
         expectations: Dict[str, dict],
@@ -2508,8 +2492,7 @@ class LogicEngine:
         if check_expectations is None:
             check_expectations = bool(active_expectations)
 
-        effective_facts = self._get_default_facts()
-        effective_facts.update(facts)
+        effective_facts = dict(facts)
 
         # Prepare candidate rules based on patch
         candidate_rules = dict(active_rules)

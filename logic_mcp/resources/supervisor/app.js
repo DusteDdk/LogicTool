@@ -315,6 +315,11 @@
     return trimLogEntries(state.logsBySession[sessionId]);
   }
 
+  function isSessionUiPaused(sessionId) {
+    const control = state.pausedLogBySession[sessionId];
+    return !!(control && control.paused);
+  }
+
   function pushSessionLogEntry(sessionId, entry) {
     const currentLive = trimLogEntries(state.logsBySession[sessionId]);
     currentLive.push(entry);
@@ -1766,11 +1771,17 @@
       const sessionId = session.session_id;
       nextIds[sessionId] = true;
       let refs = view.sessions.cardsById[sessionId];
+      let created = false;
       if (!refs) {
         refs = createSessionCard(sessionId);
         view.sessions.cardsById[sessionId] = refs;
+        created = true;
       }
-      updateSessionCard(refs, session);
+      // When paused, keep the current card DOM untouched so user input and
+      // panel state do not get reset by incoming websocket updates.
+      if (created || !isSessionUiPaused(sessionId)) {
+        updateSessionCard(refs, session);
+      }
       root.list.appendChild(refs.card);
     });
     Object.keys(view.sessions.cardsById).forEach(function (sessionId) {

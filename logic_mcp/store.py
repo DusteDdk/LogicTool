@@ -21,30 +21,59 @@ class Store:
         self.path = self.session_dir / "session.json"
         self._lock = threading.Lock()
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        self.data = self._load()
+        self.data, migrated = self._load()
+        if migrated:
+            self.save()
 
-    def _load(self) -> dict:
+    def _empty_data(self) -> dict:
+        return {
+            "symbols": {},
+            "bundles": {},
+            "rules": {},
+            "expectations": {},
+            "context": {"concepts": {}, "code_bindings": {}},
+        }
+
+    def _load(self) -> tuple[dict, bool]:
         if not self.path.exists():
-            return {
-                "symbols": {},
-                "bundles": {},
-                "rules": {},
-                "expectations": {},
-                "defaults": {},
-                "context": {"concepts": {}, "code_bindings": {}},
-            }
+            return self._empty_data(), False
         try:
             with self.path.open("r", encoding="utf-8") as f:
-                return json.load(f)
+                loaded = json.load(f)
         except Exception:
-            return {
-                "symbols": {},
-                "bundles": {},
-                "rules": {},
-                "expectations": {},
-                "defaults": {},
-                "context": {"concepts": {}, "code_bindings": {}},
-            }
+            return self._empty_data(), False
+        if not isinstance(loaded, dict):
+            return self._empty_data(), False
+
+        data = dict(loaded)
+        migrated = False
+
+        normalized: dict = {}
+        for key in ("symbols", "bundles", "rules", "expectations"):
+            value = data.get(key)
+            if not isinstance(value, dict):
+                value = {}
+                migrated = True
+            normalized[key] = value
+
+        context_value = data.get("context")
+        if not isinstance(context_value, dict):
+            context_value = {}
+            migrated = True
+        concepts = context_value.get("concepts")
+        if not isinstance(concepts, dict):
+            concepts = {}
+            migrated = True
+        code_bindings = context_value.get("code_bindings")
+        if not isinstance(code_bindings, dict):
+            code_bindings = {}
+            migrated = True
+        normalized["context"] = {"concepts": concepts, "code_bindings": code_bindings}
+
+        if set(data.keys()) != set(normalized.keys()):
+            migrated = True
+
+        return normalized, migrated
 
     def save(self) -> None:
         with self._lock:
